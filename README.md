@@ -20,11 +20,13 @@ No dependencies needed - uses Python stdlib only!
 ## ✨ Features
 
 - 🔎 **30+ Forensic Queries** - History, cookies, forms, permissions across 6 databases
+- � **Password Decryption** - Decrypt saved passwords using NSS library (Linux native Firefox)
 - 📊 **Multi-Format Reports** - HTML, Markdown, and CSV exports
 - 🔐 **Credential Detection** - Auto-highlights passwords and auth tokens
 - 💬 **Interactive Mode** - Friendly prompts guide you through extraction
 - ⏱️ **Human Timestamps** - Converts Unix time to readable dates
-- 🎯 **Zero Dependencies** - Pure Python stdlib
+- 🛡️ **Environment Validation** - Detects Snap/Flatpak/keyring limitations
+- 🎯 **Zero Dependencies** - Pure Python stdlib (libnss3 for decryption)
 
 ## 📖 Usage
 
@@ -40,7 +42,8 @@ python main.py ~/.mozilla/firefox/profile --output my_results --format all --no-
 
 **Other options:**
 ```bash
-python main.py --list-queries  # Show all available queries
+python main.py --list-queries   # Show all available queries
+python main.py --check-env      # Check password decryption compatibility
 python main.py profile --format html --verbose  # HTML only with debug logs
 ```
 
@@ -52,13 +55,13 @@ Default location: `~/Downloads/firefox_forensics_output/`
 
 ```
 output/
-├── forensics_report.html    # Styled web report
+├── forensics_report.html    # Styled web report with decrypted passwords
 ├── forensics_report.md      # Markdown tables
 ├── csv_export/              # 21 CSV files (history, cookies, forms, etc.)
 └── artifacts/               # 13 JSON files (extensions, logins, etc.)
 ```
 
-All timestamps converted to `YYYY-MM-DD HH:MM:SS` format. Credentials automatically highlighted.
+All timestamps converted to `YYYY-MM-DD HH:MM:SS` format. Credentials and decrypted passwords automatically highlighted.
 
 ## 🔍 What Gets Extracted
 
@@ -71,19 +74,39 @@ All timestamps converted to `YYYY-MM-DD HH:MM:SS` format. Credentials automatica
 - 💾 **DOM Storage** - localStorage and sessionStorage
 - 🖼️ **Favicons** - Site icons and mappings
 - 🧩 **Extensions** - Installed addons metadata
-- 🔑 **Credentials** - Encrypted login data (detection only)
+- 🔑 **Saved Passwords** - Decrypted logins via NSS (Linux native Firefox)
+
+### 🔓 Password Decryption
+
+On supported Linux systems, the tool can decrypt saved Firefox passwords:
+
+```bash
+# Check if your environment supports decryption
+python main.py --check-env
+
+# Extract with password decryption
+python main.py ~/.mozilla/firefox/profile
+```
+
+**Requirements:**
+- Native Firefox installation (not Snap/Flatpak)
+- `libnss3` system library installed
+- No OS keyring integration (GNOME Keyring/KWallet)
+
+**Master Password:** If set, the tool will prompt for it interactively.
 
 ## 🏗️ Architecture
 
 | Module | Lines | Purpose |
 |--------|-------|---------|
-| `main.py` | 622 | CLI and interactive prompts |
+| `main.py` | 861 | CLI and interactive prompts |
+| `nss_decrypt.py` | 1076 | NSS password decryption |
 | `formatters.py` | 951 | HTML/MD/CSV report generation |
 | `queries.py` | 663 | 30+ forensic SQL queries |
-| `extractor.py` | 387 | Database/JSON extraction |
+| `extractor.py` | 388 | Database/JSON extraction |
 | `utils.py` | 312 | Helper functions |
 
-**Total:** 2,935 lines of clean, modular Python code
+**Total:** ~4,200 lines of clean, modular Python code
 
 ## 💡 Use Cases
 
@@ -95,13 +118,19 @@ All timestamps converted to `YYYY-MM-DD HH:MM:SS` format. Credentials automatica
 
 ## ⚠️ Important Notes
 
-**Limitations:**
-- Encrypted passwords in `logins.json` cannot be decrypted
+**Password Decryption Limitations:**
+- ❌ **Snap Firefox** - Sandboxed, uses bundled NSS library
+- ❌ **Flatpak Firefox** - Sandboxed, uses bundled NSS library  
+- ❌ **OS Keyring** - GNOME Keyring/KWallet integration not supported
+- ❌ **Windows/macOS** - Currently Linux-only for decryption
+- ✅ **Native Linux Firefox** - Fully supported with libnss3
+
+**General Limitations:**
 - Close Firefox before extraction to avoid database locks
 - Only recoverable data is extracted (no deleted entry recovery)
 
 **Security:**
-- Output contains plaintext cookies and sensitive data
+- Output may contain **plaintext passwords**, cookies, and sensitive data
 - Treat all extracted data as confidential evidence
 - Store securely and follow data protection policies
 
@@ -113,6 +142,10 @@ All timestamps converted to `YYYY-MM-DD HH:MM:SS` format. Credentials automatica
 | Database locked | Close Firefox before running |
 | Permission denied | Run `chmod -R u+r ~/.mozilla/firefox/profile/` |
 | No query results | Database may be empty or corrupted |
+| Password decryption fails | Run `python main.py --check-env` to diagnose |
+| Snap/Flatpak detected | Use Firefox's built-in export: Settings → Passwords → Export |
+| Master password prompt | Enter your Firefox master password when prompted |
+| libnss3 missing | Install: `sudo apt install libnss3` or `sudo pacman -S nss` |
 
 ## 🤝 Contributing
 
@@ -120,10 +153,11 @@ PRs welcome! Add new queries to `queries.py` or improve formatters in `formatter
 
 ## 📊 Stats
 
-- **Code:** 2,935 lines across 5 modules
+- **Code:** ~4,200 lines across 6 modules
 - **Queries:** 30+ forensic SQL queries
 - **Formats:** HTML, Markdown, CSV
-- **Dependencies:** 0 (stdlib only)
+- **Features:** Password decryption, environment validation
+- **Dependencies:** 0 (stdlib only, libnss3 for decryption)
 
 ## 📄 License
 

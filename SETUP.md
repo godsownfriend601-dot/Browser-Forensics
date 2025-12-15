@@ -13,6 +13,7 @@ This is a professional-grade forensics extraction tool for Mozilla Firefox profi
 - **Favicons**: Cached website icons
 - **Extensions**: Installed addons with metadata
 - **Preferences**: Browser configuration
+- **Saved Passwords**: Decrypted login credentials (Linux native Firefox)
 
 ## Project Structure
 
@@ -22,6 +23,7 @@ code_base/
 ├── extractor.py         # Core extraction classes
 ├── formatters.py        # Report generation (HTML, CSV, Markdown)
 ├── queries.py           # Forensic SQL queries (30+)
+├── nss_decrypt.py       # Firefox password decryption via NSS
 ├── utils.py             # Utility functions
 ├── README.md            # Full documentation
 ├── SETUP.md             # This file
@@ -87,18 +89,38 @@ The tool will guide you through:
 ## CLI Options
 
 ```
-usage: main.py [-h] [--output OUTPUT] [--verbose] [--quiet] [--list-queries] [profile]
+usage: main.py [-h] [--output OUTPUT] [--format {html,csv,md,all}] [--no-interactive]
+               [--verbose] [--quiet] [--list-queries] [--check-env] [profile]
 
 positional arguments:
-  profile              Path to Firefox profile (required)
+  profile              Path to Firefox profile (optional - auto-detects if omitted)
 
 options:
   -h, --help           Show help message
-  --output, -o OUTPUT  Output directory (default: firefox_forensics_output)
+  --output, -o OUTPUT  Output directory (default: ~/Downloads/firefox_forensics_output)
+  --format, -f FORMAT  Output format: html, csv, md, or all (default: all)
+  --no-interactive, -n Disable interactive prompts (use defaults)
   --verbose, -v        Enable DEBUG logging
   --quiet, -q          Suppress INFO logging
   --list-queries       List all available queries and exit
+  --check-env          Check environment compatibility for password decryption
 ```
+
+### Environment Check
+
+```bash
+# Check if password decryption is supported on your system
+python main.py --check-env
+
+# Check for a specific profile
+python main.py --check-env ~/.mozilla/firefox/xxxx.default-release
+```
+
+This checks:
+- ✅ libnss3 library availability
+- ✅ Firefox installation type (native vs Snap/Flatpak)
+- ✅ Profile compatibility
+- ✅ OS keyring integration status
 
 ## Module Guide
 
@@ -108,12 +130,43 @@ options:
 - `extract_databases()`: Extract all SQLite databases
 - `extract_json_artifacts()`: Parse JSON configuration files
 - `extract_profile()`: Main orchestration function
+- `print_decrypted_passwords()`: Display decrypted passwords
+- `prompt_master_password()`: Securely prompt for master password
 - `main()`: CLI interface
 
 **Usage:**
 ```bash
 python main.py /path/to/profile --output analysis --verbose
 ```
+
+### nss_decrypt.py - Password Decryption
+
+**Classes:**
+1. **NSSDecryptor**
+   - `initialize(profile_path, master_password)`: Init NSS with profile
+   - `decrypt(encrypted_data)`: Decrypt base64-encoded data
+   - `decrypt_logins()`: Decrypt all saved passwords
+   - `shutdown()`: Cleanup NSS resources
+
+2. **DecryptedLogin** (dataclass)
+   - `url`: Login URL
+   - `hostname`: Site hostname
+   - `username`: Decrypted username
+   - `password`: Decrypted password
+   - `times_used`: Usage count
+   - `form_submit_url`: Form action URL
+
+**Exceptions:**
+- `MasterPasswordRequired`: Profile has master password
+- `UnsupportedEnvironment`: Snap/Flatpak Firefox
+- `NSSLibraryMissing`: libnss3 not found
+- `OSKeyringLocked`: GNOME Keyring/KWallet integration
+
+**Environment Functions:**
+- `validate_environment(profile_path)`: Check decryption support
+- `run_environment_check(profile_path)`: Print diagnostic info
+- `detect_firefox_installation_type()`: Native/Snap/Flatpak
+- `check_nss_library_available()`: Find libnss3
 
 ### extractor.py - Core Extraction
 
@@ -504,9 +557,25 @@ chmod -R 755 ~/.mozilla/firefox/profile/
 ## Security Notes
 
 - **Sensitive Data**: Output contains cookies, emails, search history
-- **Handle Carefully**: Treat output directory as evidence
-- **Encryption**: Passwords in logins.json remain encrypted
-- **Plaintext**: All other artifacts are plaintext
+- **Decrypted Passwords**: On supported systems, saved passwords are decrypted
+- **Handle Carefully**: Treat output directory as confidential evidence
+- **Plaintext Output**: Decrypted passwords appear in terminal and reports
+- **Master Password**: If set, required for decryption (prompted interactively)
+
+### Password Decryption Limitations
+
+| Environment | Supported | Notes |
+|-------------|-----------|-------|
+| Native Linux Firefox | ✅ Yes | Requires libnss3 |
+| Snap Firefox | ❌ No | Sandboxed NSS library |
+| Flatpak Firefox | ❌ No | Sandboxed NSS library |
+| GNOME Keyring | ❌ No | Keys stored in system keyring |
+| KWallet | ❌ No | Keys stored in system keyring |
+| Windows | ❌ No | Different encryption mechanism |
+| macOS | ❌ No | Different encryption mechanism |
+
+**Workaround for unsupported environments:**
+- Firefox → Settings → Passwords → ⋮ (menu) → Export Logins
 
 ## References
 
@@ -516,6 +585,6 @@ chmod -R 755 ~/.mozilla/firefox/profile/
 
 ---
 
-**Created:** November 2025
+**Created:** December 2025
 **Python Version:** 3.9+
-**License:** For authorized forensic use only
+**License:** MIT License - For authorized forensic use only

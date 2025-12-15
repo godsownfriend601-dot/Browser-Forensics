@@ -6,16 +6,20 @@
 - **[FIREFOX_FORENSICS.md](FIREFOX_FORENSICS.md)** - Forensic reference guide
 
 ## Source Files
-- **[main.py](main.py)** - CLI entry point
+- **[main.py](main.py)** - CLI entry point and orchestrator
+- **[nss_decrypt.py](nss_decrypt.py)** - Firefox password decryption via NSS
 - **[extractor.py](extractor.py)** - Database extraction core
-- **[formatters.py](formatters.py)** - Report generation
+- **[formatters.py](formatters.py)** - Report generation (HTML/CSV/MD)
 - **[queries.py](queries.py)** - Forensic SQL queries
 - **[utils.py](utils.py)** - Utility functions
 
 ## Quick Usage
 
 ```bash
-# Basic extraction
+# Basic extraction (interactive profile selection)
+python main.py
+
+# Extract specific profile
 python main.py ~/.mozilla/firefox/profile.default
 
 # Custom output directory
@@ -23,6 +27,9 @@ python main.py /path/to/profile --output my_analysis
 
 # List available queries
 python main.py --list-queries
+
+# Check password decryption support
+python main.py --check-env
 ```
 
 ## Forensic Queries
@@ -48,10 +55,24 @@ firefox_forensics_output/
 ## Key Features
 
 - ✓ Automatic database detection and table enumeration
-- ✓ 20+ forensic SQL queries (history, cookies, forms, permissions)
-- ✓ CSV exports and Markdown reports
+- ✓ 30+ forensic SQL queries (history, cookies, forms, permissions)
+- ✓ **Password decryption** via NSS (Linux native Firefox)
+- ✓ HTML, CSV, and Markdown report generation
 - ✓ JSON artifact parsing (extensions, sessions)
-- ✓ Zero external dependencies (Python stdlib only)
+- ✓ Interactive profile selection
+- ✓ Master password support
+- ✓ Environment validation for decryption compatibility
+- ✓ Zero external dependencies (Python stdlib only, libnss3 for decryption)
+
+## Password Decryption
+
+```bash
+# Check if your system supports password decryption
+python main.py --check-env
+
+# Supported: Native Linux Firefox with libnss3
+# NOT Supported: Snap, Flatpak, GNOME Keyring, KWallet, Windows, macOS
+```
 
 ## Common Tasks
 
@@ -82,4 +103,4 @@ for db in extractor.find_databases():
 
 ---
 
-**Python 3.9+ | No Dependencies | CSV/Markdown Output**
+**Python 3.9+ | Linux Password Decryption | HTML/CSV/Markdown Output**
