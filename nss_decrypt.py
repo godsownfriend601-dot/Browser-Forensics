@@ -8,14 +8,19 @@ This module handles:
 - key4.db (master key database, SQLite + NSS format)
 - Both master password protected and unprotected profiles
 
+Supported platforms:
+- Windows (uses Firefox's bundled nss3.dll)
+- Linux native Firefox (uses system libnss3.so)
+
 Unsupported cases (detected and refused):
 - Snap/Flatpak Firefox installations (sandboxed, different NSS)
 - OS keyring–locked profiles (GNOME Keyring / KWallet integration)
-- Missing libnss3 library
+- Missing NSS library
 
 Requirements:
-- libnss3 system library (usually pre-installed on Linux)
-- Native Firefox installation (not Snap/Flatpak)
+- Windows: Firefox must be installed (uses bundled NSS DLLs)
+- Linux: libnss3 system library (usually pre-installed)
+- Native Firefox installation (not Snap/Flatpak on Linux)
 - No pip packages needed
 """
 
@@ -35,6 +40,10 @@ from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import tempfile
 import shutil
+
+# Windows-specific imports
+if sys.platform == 'win32':
+    import winreg
 
 
 # NSS Library structures and constants
@@ -81,14 +90,91 @@ class OSKeyringLocked(Exception):
 # Environment Detection Functions
 # =============================================================================
 
+# =============================================================================
+# Windows-Specific Functions
+# =============================================================================
+
+def find_firefox_windows() -> Optional[Path]:
+    """Find Firefox installation directory on Windows.
+    
+    Checks registry first, then common installation paths.
+    
+    Returns:
+        Path to Firefox installation directory, or None if not found
+    """
+    if sys.platform != 'win32':
+        return None
+    
+    # Try registry first (most reliable)
+    registry_paths = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\\Mozilla\\Mozilla Firefox"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\\WOW6432Node\\Mozilla\\Mozilla Firefox"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\\Mozilla\\Mozilla Firefox"),
+    ]
+    
+    for hkey, subkey in registry_paths:
+        try:
+            with winreg.OpenKey(hkey, subkey) as key:
+                # Get the current version
+                version, _ = winreg.QueryValueEx(key, "CurrentVersion")
+                version_key = f"{subkey}\\{version}\\Main"
+                with winreg.OpenKey(hkey, version_key) as vkey:
+                    install_dir, _ = winreg.QueryValueEx(vkey, "Install Directory")
+                    install_path = Path(install_dir)
+                    if install_path.exists() and (install_path / "nss3.dll").exists():
+                        return install_path
+        except (FileNotFoundError, OSError, WindowsError):
+            continue
+    
+    # Fallback to common paths
+    common_paths = [
+        Path(os.environ.get('PROGRAMFILES', 'C:\\Program Files')) / "Mozilla Firefox",
+        Path(os.environ.get('PROGRAMFILES(X86)', 'C:\\Program Files (x86)')) / "Mozilla Firefox",
+        Path(os.environ.get('LOCALAPPDATA', '')) / "Mozilla Firefox",
+        Path("C:\\Program Files\\Mozilla Firefox"),
+        Path("C:\\Program Files (x86)\\Mozilla Firefox"),
+    ]
+    
+    for path in common_paths:
+        if path.exists() and (path / "nss3.dll").exists():
+            return path
+    
+    return None
+
+
+def get_windows_firefox_profile_dir() -> Optional[Path]:
+    """Get the Firefox profiles directory on Windows.
+    
+    Returns:
+        Path to Firefox profiles directory, or None if not found
+    """
+    if sys.platform != 'win32':
+        return None
+    
+    appdata = os.environ.get('APPDATA')
+    if appdata:
+        profiles_dir = Path(appdata) / "Mozilla" / "Firefox" / "Profiles"
+        if profiles_dir.exists():
+            return profiles_dir
+    
+    return None
+
+
 def detect_firefox_installation_type() -> Tuple[str, Optional[str]]:
     """Detect how Firefox is installed on the system.
     
     Returns:
         Tuple of (installation_type, details)
-        installation_type: 'native', 'snap', 'flatpak', 'unknown'
+        installation_type: 'native', 'snap', 'flatpak', 'unknown', 'windows'
         details: Additional information or path
     """
+    # Windows detection
+    if sys.platform == 'win32':
+        firefox_path = find_firefox_windows()
+        if firefox_path:
+            return 'windows', str(firefox_path)
+        return 'unknown', None
+    
     # Check for Snap Firefox
     snap_firefox_paths = [
         Path('/snap/firefox'),
@@ -166,11 +252,35 @@ def is_flatpak_profile(profile_path: Path) -> bool:
 
 
 def check_nss_library_available() -> Tuple[bool, Optional[str], Optional[str]]:
-    """Check if libnss3 is available on the system.
+    """Check if NSS library is available on the system.
+    
+    On Windows, checks for nss3.dll in Firefox installation.
+    On Linux, checks for libnss3.so in system paths.
     
     Returns:
         Tuple of (available, library_path, error_message)
     """
+    # Windows: Look for nss3.dll in Firefox installation
+    if sys.platform == 'win32':
+        firefox_path = find_firefox_windows()
+        if firefox_path:
+            nss_dll = firefox_path / "nss3.dll"
+            mozglue_dll = firefox_path / "mozglue.dll"
+            
+            if nss_dll.exists() and mozglue_dll.exists():
+                try:
+                    # On Windows, must load mozglue.dll first
+                    ctypes.CDLL(str(mozglue_dll))
+                    ctypes.CDLL(str(nss_dll))
+                    return True, str(nss_dll), None
+                except OSError as e:
+                    return False, str(nss_dll), f"Found but cannot load: {e}"
+            elif nss_dll.exists():
+                return False, str(nss_dll), "mozglue.dll not found (required dependency)"
+        
+        return False, None, "Firefox installation not found. Install Firefox to decrypt passwords."
+    
+    # Linux: Check system paths for libnss3.so
     nss_paths = [
         '/usr/lib/libnss3.so',
         '/usr/lib64/libnss3.so',
@@ -378,39 +488,47 @@ def validate_environment(profile_path: Path) -> Tuple[bool, Optional[str]]:
     
     Raises:
         UnsupportedEnvironment: If environment is not supported
-        NSSLibraryMissing: If libnss3 is not available
+        NSSLibraryMissing: If NSS library is not available
         OSKeyringLocked: If profile uses OS keyring
     """
     errors = []
     
-    # 1. Check for libnss3
+    # 1. Check for NSS library (nss3.dll on Windows, libnss3.so on Linux)
     nss_available, nss_path, nss_error = check_nss_library_available()
     if not nss_available:
-        help_text = get_nss_install_help()
-        raise NSSLibraryMissing(f"libnss3 not available: {nss_error}\n{help_text}")
+        if sys.platform == 'win32':
+            raise NSSLibraryMissing(
+                f"NSS library not available: {nss_error}\n"
+                "Please install Firefox to decrypt passwords."
+            )
+        else:
+            help_text = get_nss_install_help()
+            raise NSSLibraryMissing(f"libnss3 not available: {nss_error}\n{help_text}")
     
-    # 2. Check for Snap profile
-    if is_snap_profile(profile_path):
-        help_text = get_installation_help('snap')
-        raise UnsupportedEnvironment(f"Snap Firefox profile detected\n{help_text}")
-    
-    # 3. Check for Flatpak profile
-    if is_flatpak_profile(profile_path):
-        help_text = get_installation_help('flatpak')
-        raise UnsupportedEnvironment(f"Flatpak Firefox profile detected\n{help_text}")
-    
-    # 4. Check Firefox installation type (warning only for non-matching)
-    install_type, install_path = detect_firefox_installation_type()
-    if install_type in ('snap', 'flatpak'):
-        # Profile might be from a different Firefox installation
-        # This is a warning, not an error
-        pass
-    
-    # 5. Check for OS keyring integration
-    uses_keyring, keyring_type = check_os_keyring_integration(profile_path)
-    if uses_keyring:
-        help_text = get_keyring_help(keyring_type or 'Unknown')
-        raise OSKeyringLocked(f"Profile uses {keyring_type}\n{help_text}")
+    # 2-4. Snap/Flatpak checks only apply to Linux
+    if sys.platform != 'win32':
+        # Check for Snap profile
+        if is_snap_profile(profile_path):
+            help_text = get_installation_help('snap')
+            raise UnsupportedEnvironment(f"Snap Firefox profile detected\n{help_text}")
+        
+        # Check for Flatpak profile
+        if is_flatpak_profile(profile_path):
+            help_text = get_installation_help('flatpak')
+            raise UnsupportedEnvironment(f"Flatpak Firefox profile detected\n{help_text}")
+        
+        # Check Firefox installation type (warning only for non-matching)
+        install_type, install_path = detect_firefox_installation_type()
+        if install_type in ('snap', 'flatpak'):
+            # Profile might be from a different Firefox installation
+            # This is a warning, not an error
+            pass
+        
+        # Check for OS keyring integration (Linux-specific)
+        uses_keyring, keyring_type = check_os_keyring_integration(profile_path)
+        if uses_keyring:
+            help_text = get_keyring_help(keyring_type or 'Unknown')
+            raise OSKeyringLocked(f"Profile uses {keyring_type}\n{help_text}")
     
     return True, None
 
@@ -431,6 +549,7 @@ def print_environment_status(profile_path: Optional[Path] = None) -> dict:
         'keyring_type': None,
         'supported': False,
         'errors': [],
+        'platform': sys.platform,
     }
     
     # Check NSS
@@ -444,27 +563,35 @@ def print_environment_status(profile_path: Optional[Path] = None) -> dict:
     install_type, install_path = detect_firefox_installation_type()
     status['firefox_type'] = install_type
     status['firefox_path'] = install_path
-    if install_type in ('snap', 'flatpak'):
+    
+    # Snap/Flatpak only relevant on Linux
+    if sys.platform != 'win32' and install_type in ('snap', 'flatpak'):
         status['errors'].append(f"Firefox installed via {install_type}")
     
     # Check profile if provided
     if profile_path:
         profile_path = Path(profile_path)
         
-        if is_snap_profile(profile_path):
-            status['profile_type'] = 'snap'
-            status['errors'].append("Profile is from Snap Firefox")
-        elif is_flatpak_profile(profile_path):
-            status['profile_type'] = 'flatpak'
-            status['errors'].append("Profile is from Flatpak Firefox")
+        # Snap/Flatpak profile checks only for Linux
+        if sys.platform != 'win32':
+            if is_snap_profile(profile_path):
+                status['profile_type'] = 'snap'
+                status['errors'].append("Profile is from Snap Firefox")
+            elif is_flatpak_profile(profile_path):
+                status['profile_type'] = 'flatpak'
+                status['errors'].append("Profile is from Flatpak Firefox")
+            else:
+                status['profile_type'] = 'native'
+            
+            # OS keyring check only for Linux
+            uses_keyring, keyring_type = check_os_keyring_integration(profile_path)
+            status['uses_keyring'] = uses_keyring
+            status['keyring_type'] = keyring_type
+            if uses_keyring:
+                status['errors'].append(f"Profile uses {keyring_type}")
         else:
-            status['profile_type'] = 'native'
-        
-        uses_keyring, keyring_type = check_os_keyring_integration(profile_path)
-        status['uses_keyring'] = uses_keyring
-        status['keyring_type'] = keyring_type
-        if uses_keyring:
-            status['errors'].append(f"Profile uses {keyring_type}")
+            # Windows profiles are always "native"
+            status['profile_type'] = 'windows'
     
     # Determine overall support
     status['supported'] = len(status['errors']) == 0
@@ -490,8 +617,8 @@ class DecryptedLogin:
 class NSSDecryptor:
     """Handles Firefox password decryption using NSS library."""
     
-    # NSS library paths to try
-    NSS_LIBRARY_PATHS = [
+    # Linux NSS library paths to try
+    NSS_LIBRARY_PATHS_LINUX = [
         '/usr/lib/libnss3.so',
         '/usr/lib64/libnss3.so',
         '/usr/lib/x86_64-linux-gnu/libnss3.so',
@@ -501,13 +628,53 @@ class NSSDecryptor:
     
     def __init__(self):
         self._nss = None
+        self._mozglue = None  # Windows: mozglue.dll dependency
         self._initialized = False
         self._profile_path: Optional[Path] = None
         self._temp_dir: Optional[Path] = None
+        self._firefox_path: Optional[Path] = None  # Windows: Firefox installation path
         
     def _load_nss_library(self) -> ctypes.CDLL:
-        """Load the NSS library."""
-        for path in self.NSS_LIBRARY_PATHS:
+        """Load the NSS library.
+        
+        On Windows, loads mozglue.dll first (required dependency),
+        then loads nss3.dll from Firefox installation directory.
+        On Linux, loads libnss3.so from system paths.
+        """
+        # Windows: Load from Firefox installation
+        if sys.platform == 'win32':
+            self._firefox_path = find_firefox_windows()
+            if not self._firefox_path:
+                raise NSSError(
+                    "Could not find Firefox installation on Windows. "
+                    "Please install Firefox to decrypt passwords."
+                )
+            
+            nss_dll = self._firefox_path / "nss3.dll"
+            mozglue_dll = self._firefox_path / "mozglue.dll"
+            
+            if not mozglue_dll.exists():
+                raise NSSError(
+                    f"mozglue.dll not found at {self._firefox_path}. "
+                    "Firefox installation may be corrupted."
+                )
+            
+            if not nss_dll.exists():
+                raise NSSError(
+                    f"nss3.dll not found at {self._firefox_path}. "
+                    "Firefox installation may be corrupted."
+                )
+            
+            try:
+                # CRITICAL: Must load mozglue.dll BEFORE nss3.dll
+                self._mozglue = ctypes.CDLL(str(mozglue_dll))
+                nss = ctypes.CDLL(str(nss_dll))
+                return nss
+            except OSError as e:
+                raise NSSError(f"Failed to load NSS DLLs from {self._firefox_path}: {e}")
+        
+        # Linux: Load from system paths
+        for path in self.NSS_LIBRARY_PATHS_LINUX:
             try:
                 nss = ctypes.CDLL(path)
                 return nss
@@ -859,6 +1026,10 @@ def run_environment_check(profile_path: Optional[Path] = None, verbose: bool = T
         print("\n" + "=" * 70)
         print("  FIREFOX PASSWORD DECRYPTION - ENVIRONMENT CHECK")
         print("=" * 70 + "\n")
+        
+        # Show platform
+        platform_name = "Windows" if sys.platform == 'win32' else "Linux" if sys.platform.startswith('linux') else sys.platform
+        print(f"🖥️  Platform: {platform_name}")
     
     all_ok = True
     
@@ -866,7 +1037,8 @@ def run_environment_check(profile_path: Optional[Path] = None, verbose: bool = T
     nss_ok, nss_path, nss_error = check_nss_library_available()
     if verbose:
         if nss_ok:
-            print(f"✅ NSS Library: Found at {nss_path}")
+            lib_name = "nss3.dll" if sys.platform == 'win32' else "libnss3.so"
+            print(f"✅ NSS Library ({lib_name}): Found at {nss_path}")
         else:
             print(f"❌ NSS Library: NOT FOUND")
             print(f"   {nss_error}")
@@ -875,7 +1047,9 @@ def run_environment_check(profile_path: Optional[Path] = None, verbose: bool = T
     # 2. Check Firefox installation type
     install_type, install_path = detect_firefox_installation_type()
     if verbose:
-        if install_type == 'native':
+        if install_type == 'windows':
+            print(f"✅ Firefox Installation: Windows ({install_path})")
+        elif install_type == 'native':
             print(f"✅ Firefox Installation: Native ({install_path})")
         elif install_type == 'snap':
             print(f"⚠️  Firefox Installation: Snap detected ({install_path})")
@@ -891,6 +1065,7 @@ def run_environment_check(profile_path: Optional[Path] = None, verbose: bool = T
     profile_snap = False
     profile_flatpak = False
     profile_keyring = False
+    keyring_type = None
     
     # 3. Check profile if provided
     if profile_path:
@@ -904,36 +1079,42 @@ def run_environment_check(profile_path: Optional[Path] = None, verbose: bool = T
             all_ok = False
             profile_ok = False
         else:
-            # Check profile type
-            if is_snap_profile(profile_path):
+            # Profile type checks differ by platform
+            if sys.platform == 'win32':
+                # Windows profiles are always supported
                 if verbose:
-                    print(f"   ❌ Profile Type: Snap (UNSUPPORTED)")
-                all_ok = False
-                profile_ok = False
-                profile_snap = True
-            elif is_flatpak_profile(profile_path):
-                if verbose:
-                    print(f"   ❌ Profile Type: Flatpak (UNSUPPORTED)")
-                all_ok = False
-                profile_ok = False
-                profile_flatpak = True
+                    print(f"   ✅ Profile Type: Windows")
             else:
-                if verbose:
-                    print(f"   ✅ Profile Type: Native")
+                # Linux: Check for Snap/Flatpak
+                if is_snap_profile(profile_path):
+                    if verbose:
+                        print(f"   ❌ Profile Type: Snap (UNSUPPORTED)")
+                    all_ok = False
+                    profile_ok = False
+                    profile_snap = True
+                elif is_flatpak_profile(profile_path):
+                    if verbose:
+                        print(f"   ❌ Profile Type: Flatpak (UNSUPPORTED)")
+                    all_ok = False
+                    profile_ok = False
+                    profile_flatpak = True
+                else:
+                    if verbose:
+                        print(f"   ✅ Profile Type: Native")
+                
+                # OS keyring check (Linux only)
+                uses_keyring, keyring_type = check_os_keyring_integration(profile_path)
+                if uses_keyring:
+                    if verbose:
+                        print(f"   ❌ OS Keyring: {keyring_type} (UNSUPPORTED)")
+                    all_ok = False
+                    profile_ok = False
+                    profile_keyring = True
+                else:
+                    if verbose:
+                        print(f"   ✅ OS Keyring: Not used")
             
-            # Check keyring
-            uses_keyring, keyring_type = check_os_keyring_integration(profile_path)
-            if uses_keyring:
-                if verbose:
-                    print(f"   ❌ OS Keyring: {keyring_type} (UNSUPPORTED)")
-                all_ok = False
-                profile_ok = False
-                profile_keyring = True
-            else:
-                if verbose:
-                    print(f"   ✅ OS Keyring: Not used")
-            
-            # Check key database
+            # Check key database (same for all platforms)
             key4_path = profile_path / 'key4.db'
             key3_path = profile_path / 'key3.db'
             logins_path = profile_path / 'logins.json'

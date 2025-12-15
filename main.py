@@ -75,15 +75,24 @@ def colorize(text: str, color: str) -> str:
     return text
 
 
+def safe_print(text: str):
+    """Print text with fallback for encoding issues on Windows."""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        # Fallback: replace problematic characters
+        print(text.encode('ascii', 'replace').decode('ascii'))
+
+
 def print_banner():
     """Print the tool banner."""
     banner = f"""
-{colorize('╔══════════════════════════════════════════════════════════════════════╗', Colors.CYAN)}
-{colorize('║', Colors.CYAN)}  {colorize('🔍 FIREFOX FORENSICS EXTRACTION TOOL', Colors.BOLD + Colors.WHITE)}                           {colorize('║', Colors.CYAN)}
-{colorize('║', Colors.CYAN)}  {colorize('Extract • Analyze • Report', Colors.YELLOW)}                                       {colorize('║', Colors.CYAN)}
-{colorize('╚══════════════════════════════════════════════════════════════════════╝', Colors.CYAN)}
+{colorize('=' * 72, Colors.CYAN)}
+{colorize('  FIREFOX FORENSICS EXTRACTION TOOL', Colors.BOLD + Colors.WHITE)}
+{colorize('  Extract - Analyze - Report', Colors.YELLOW)}
+{colorize('=' * 72, Colors.CYAN)}
 """
-    print(banner)
+    safe_print(banner)
 
 
 def print_credentials_summary(credentials: list):
@@ -238,12 +247,23 @@ def prompt_path(question: str, default: str = None) -> Path:
 def get_firefox_profiles() -> list:
     """Read Firefox profiles.ini and return list of profiles.
     
+    Works on both Windows and Linux.
+    
     Returns:
         List of dicts with profile info: {'name': str, 'path': str, 'is_default': bool, 'full_path': Path}
     """
     import configparser
     
-    firefox_dir = Path.home() / ".mozilla" / "firefox"
+    # Determine Firefox directory based on platform
+    if sys.platform == 'win32':
+        appdata = os.environ.get('APPDATA', '')
+        if appdata:
+            firefox_dir = Path(appdata) / "Mozilla" / "Firefox"
+        else:
+            firefox_dir = Path.home() / "AppData" / "Roaming" / "Mozilla" / "Firefox"
+    else:
+        firefox_dir = Path.home() / ".mozilla" / "firefox"
+    
     profiles_ini = firefox_dir / "profiles.ini"
     
     if not profiles_ini.exists():
@@ -300,7 +320,10 @@ def prompt_profile_selection() -> Path:
     profiles = get_firefox_profiles()
     
     if not profiles:
-        print(f"{colorize('No Firefox profiles found in ~/.mozilla/firefox/', Colors.RED)}")
+        if sys.platform == 'win32':
+            print(f"{colorize('No Firefox profiles found in %APPDATA%\\Mozilla\\Firefox\\', Colors.RED)}")
+        else:
+            print(f"{colorize('No Firefox profiles found in ~/.mozilla/firefox/', Colors.RED)}")
         return None
     
     print(f"\n{colorize('Available Firefox Profiles:', Colors.CYAN)}")
@@ -686,7 +709,7 @@ def extract_profile(
         profile_path, db_results, json_data, output_dir
     )
     master_report_path = output_dir / "master_report.md"
-    master_report_path.write_text(master_report)
+    master_report_path.write_text(master_report, encoding='utf-8')
 
     # Summary
     print(f"\n{colorize('═' * 70, Colors.GREEN)}")

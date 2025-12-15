@@ -566,13 +566,13 @@ chmod -R 755 ~/.mozilla/firefox/profile/
 
 | Environment | Supported | Notes |
 |-------------|-----------|-------|
+| Windows | ✅ Yes | Firefox must be installed (uses nss3.dll) |
 | Native Linux Firefox | ✅ Yes | Requires libnss3 |
 | Snap Firefox | ❌ No | Sandboxed NSS library |
 | Flatpak Firefox | ❌ No | Sandboxed NSS library |
 | GNOME Keyring | ❌ No | Keys stored in system keyring |
 | KWallet | ❌ No | Keys stored in system keyring |
-| Windows | ❌ No | Different encryption mechanism |
-| macOS | ❌ No | Different encryption mechanism |
+| macOS | ❌ No | Not yet implemented |
 
 **Workaround for unsupported environments:**
 - Firefox → Settings → Passwords → ⋮ (menu) → Export Logins

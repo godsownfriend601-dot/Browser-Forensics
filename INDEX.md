@@ -70,8 +70,8 @@ firefox_forensics_output/
 # Check if your system supports password decryption
 python main.py --check-env
 
-# Supported: Native Linux Firefox with libnss3
-# NOT Supported: Snap, Flatpak, GNOME Keyring, KWallet, Windows, macOS
+# Supported: Windows, Native Linux Firefox with libnss3
+# NOT Supported: Snap, Flatpak, GNOME Keyring, KWallet, macOS
 ```
 
 ## Common Tasks
@@ -103,4 +103,4 @@ for db in extractor.find_databases():
 
 ---
 
-**Python 3.9+ | Linux Password Decryption | HTML/CSV/Markdown Output**
+**Python 3.9+ | Windows & Linux Password Decryption | HTML/CSV/Markdown Output**

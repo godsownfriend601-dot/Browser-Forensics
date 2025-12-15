@@ -20,13 +20,13 @@ No dependencies needed - uses Python stdlib only!
 ## ✨ Features
 
 - 🔎 **30+ Forensic Queries** - History, cookies, forms, permissions across 6 databases
-- � **Password Decryption** - Decrypt saved passwords using NSS library (Linux native Firefox)
+- 🔓 **Password Decryption** - Decrypt saved passwords using NSS library (Windows & Linux)
 - 📊 **Multi-Format Reports** - HTML, Markdown, and CSV exports
 - 🔐 **Credential Detection** - Auto-highlights passwords and auth tokens
 - 💬 **Interactive Mode** - Friendly prompts guide you through extraction
 - ⏱️ **Human Timestamps** - Converts Unix time to readable dates
 - 🛡️ **Environment Validation** - Detects Snap/Flatpak/keyring limitations
-- 🎯 **Zero Dependencies** - Pure Python stdlib (libnss3 for decryption)
+- 🎯 **Zero Dependencies** - Pure Python stdlib (uses Firefox's bundled NSS)
 
 ## 📖 Usage
 
@@ -78,17 +78,21 @@ All timestamps converted to `YYYY-MM-DD HH:MM:SS` format. Credentials and decryp
 
 ### 🔓 Password Decryption
 
-On supported Linux systems, the tool can decrypt saved Firefox passwords:
+The tool can decrypt saved Firefox passwords on supported systems:
 
 ```bash
 # Check if your environment supports decryption
 python main.py --check-env
 
 # Extract with password decryption
-python main.py ~/.mozilla/firefox/profile
+python main.py  # Interactive profile selection
 ```
 
-**Requirements:**
+**Windows Requirements:**
+- Firefox must be installed (uses bundled nss3.dll)
+- Profile at `%APPDATA%\Mozilla\Firefox\Profiles\`
+
+**Linux Requirements:**
 - Native Firefox installation (not Snap/Flatpak)
 - `libnss3` system library installed
 - No OS keyring integration (GNOME Keyring/KWallet)
@@ -118,12 +122,13 @@ python main.py ~/.mozilla/firefox/profile
 
 ## ⚠️ Important Notes
 
-**Password Decryption Limitations:**
+**Password Decryption Support:**
+- ✅ **Windows** - Fully supported (Firefox must be installed)
+- ✅ **Native Linux Firefox** - Fully supported with libnss3
 - ❌ **Snap Firefox** - Sandboxed, uses bundled NSS library
 - ❌ **Flatpak Firefox** - Sandboxed, uses bundled NSS library  
 - ❌ **OS Keyring** - GNOME Keyring/KWallet integration not supported
-- ❌ **Windows/macOS** - Currently Linux-only for decryption
-- ✅ **Native Linux Firefox** - Fully supported with libnss3
+- ❌ **macOS** - Not yet supported
 
 **General Limitations:**
 - Close Firefox before extraction to avoid database locks
