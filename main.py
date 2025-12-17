@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Firefox Forensics Extraction Tool.
+"""Browser Forensics Extraction Tool.
 
 A comprehensive Python utility for extracting and analyzing forensic artifacts
-from Firefox profiles including browsing history, cookies, form data, permissions,
-and more. Results are exported in multiple formats (HTML, CSV, Markdown).
+from web browsers including Firefox and Chromium-based browsers (Chrome, Edge,
+Brave, Opera, Vivaldi). Results are exported in multiple formats (HTML, CSV, Markdown).
 
 Usage:
-    python main.py /path/to/firefox/profile
-    python main.py ~/.mozilla/firefox/xxxx.default-release
+    python main.py                              # Auto-detect all browsers
+    python main.py -b firefox                   # Firefox only
+    python main.py -b chrome                    # Chrome only  
+    python main.py -b brave                     # Brave only
+    python main.py /path/to/profile             # Specific profile path
+    python main.py --list-browsers              # List all detected browsers
     python main.py --help
 
 """
@@ -16,6 +20,7 @@ import argparse
 import logging
 import sys
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -58,6 +63,19 @@ from report_builder import ForensicReportBuilder, build_forensic_report
 from report_generators import ReportOutputManager
 from forensic_models import ProcessingStatus
 
+# Import browser detection and Chromium support
+from browser_profiles import (
+    BrowserProfile,
+    BrowserType,
+    BrowserFamily,
+    BrowserInstallation,
+    detect_all_browsers,
+    detect_browser_from_path,
+)
+from chromium_extractor import ChromiumDatabaseExtractor, ChromiumJSONExtractor
+from chromium_decrypt import decrypt_chromium_passwords, check_decryption_requirements, DecryptedCredential
+
+
 
 # ANSI color codes for terminal output
 class Colors:
@@ -93,11 +111,479 @@ def print_banner():
     """Print the tool banner."""
     banner = f"""
 {colorize('=' * 72, Colors.CYAN)}
-{colorize('  FIREFOX FORENSICS EXTRACTION TOOL', Colors.BOLD + Colors.WHITE)}
-{colorize('  Extract - Analyze - Report', Colors.YELLOW)}
+{colorize('  BROWSER FORENSICS EXTRACTION TOOL', Colors.BOLD + Colors.WHITE)}
+{colorize('  Firefox | Chrome | Edge | Brave | Opera | Vivaldi', Colors.YELLOW)}
 {colorize('=' * 72, Colors.CYAN)}
 """
     safe_print(banner)
+
+
+def get_system_info() -> dict:
+    """Get system/OS information."""
+    import platform
+    return {
+        "os": platform.system(),
+        "os_release": platform.release(),
+        "os_version": platform.version(),
+        "machine": platform.machine(),
+        "hostname": platform.node(),
+    }
+
+
+def print_system_info():
+    """Print detected system information."""
+    info = get_system_info()
+    print(f"\n{colorize('[*] System Detected:', Colors.CYAN)}")
+    print(f"    {colorize('OS:', Colors.WHITE)} {info['os']} {info['os_release']}")
+    print(f"    {colorize('Host:', Colors.WHITE)} {info['hostname']}")
+    print(f"    {colorize('Arch:', Colors.WHITE)} {info['machine']}")
+
+
+def print_detected_browsers_ui(installations: list, filter_browser: str = None):
+    """Print detected browsers in a nice format.
+    
+    Args:
+        installations: List of detected browser installations
+        filter_browser: Optional browser type to filter (e.g., 'chrome', 'firefox')
+    
+    Returns:
+        Dictionary mapping index to BrowserProfile, or None if no browsers found
+    """
+    # Filter installations if browser type specified
+    if filter_browser and filter_browser != "auto":
+        installations = [
+            inst for inst in installations 
+            if inst.browser_type.value.lower() == filter_browser.lower()
+        ]
+    
+    if not installations:
+        if filter_browser and filter_browser != "auto":
+            print(f"\n{colorize(f'[!] No {filter_browser.upper()} browser detected on this system.', Colors.RED)}")
+        else:
+            print(f"\n{colorize('[!] No browsers detected on this system.', Colors.RED)}")
+        return None
+    
+    # Count total profiles
+    total_profiles = sum(len(inst.profiles) for inst in installations)
+    print(f"\n{colorize('[+] Found', Colors.GREEN)} {colorize(str(len(installations)), Colors.YELLOW)} {colorize('browser(s) with', Colors.GREEN)} {colorize(str(total_profiles), Colors.YELLOW)} {colorize('profile(s)', Colors.GREEN)}")
+    
+    print(f"\n{colorize('Available Profiles:', Colors.CYAN)}")
+    print(f"{colorize('─' * 50, Colors.CYAN)}")
+    
+    idx = 1
+    profile_map = {}  # idx -> profile
+    
+    for installation in installations:
+        browser_name = installation.browser_type.value.upper()
+        family = "Gecko" if installation.browser_family == BrowserFamily.GECKO else "Chromium"
+        
+        print(f"\n  {colorize(browser_name, Colors.BOLD + Colors.WHITE)} ({family})")
+        
+        for profile in installation.profiles:
+            default_marker = colorize(' (default)', Colors.GREEN) if profile.is_default else ''
+            # Extract the actual profile name from display_name
+            if " - " in profile.display_name:
+                actual_name = profile.display_name.split(" - ", 1)[1]
+            else:
+                actual_name = profile.profile_name
+            print(f"    {colorize(f'[{idx}]', Colors.YELLOW)} {actual_name}{default_marker}")
+            profile_map[idx] = profile
+            idx += 1
+    
+    print(f"\n  {colorize('[0]', Colors.RED)} Exit")
+    return profile_map
+
+
+def prompt_browser_selection(filter_browser: str = None) -> BrowserProfile:
+    """Prompt user to select a browser profile (multi-browser support).
+    
+    Args:
+        filter_browser: Optional browser type to filter
+    
+    Returns:
+        Selected BrowserProfile or None if cancelled
+    """
+    # Show system info
+    print_system_info()
+    
+    # Detect browsers
+    print(f"\n{colorize('[*] Scanning for installed browsers...', Colors.CYAN)}")
+    installations = detect_all_browsers()
+    profile_map = print_detected_browsers_ui(installations, filter_browser)
+    
+    if not profile_map:
+        return None
+    
+    # Find default profile
+    default_idx = 1
+    for idx, profile in profile_map.items():
+        if profile.is_default:
+            default_idx = idx
+            break
+    
+    prompt = f"\n{colorize('?', Colors.GREEN)} Select browser profile [{default_idx}]: "
+    
+    while True:
+        try:
+            response = input(prompt).strip()
+            
+            if not response:
+                return profile_map[default_idx]
+            
+            if response == '0':
+                return None
+            
+            try:
+                choice = int(response)
+                if choice in profile_map:
+                    selected = profile_map[choice]
+                    print(f"  {colorize('[+]', Colors.GREEN)} Selected: {selected.display_name}")
+                    return selected
+                else:
+                    print(f"  {colorize(f'Please enter a number between 1 and {len(profile_map)}, or 0 to exit', Colors.YELLOW)}")
+            except ValueError:
+                print(f"  {colorize('Please enter a valid number', Colors.YELLOW)}")
+                
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return None
+
+
+def print_credentials_chromium(credentials: list):
+    """Print decrypted Chromium credentials."""
+    if not credentials:
+        print(f"\n{colorize('[*] No saved passwords found in this profile.', Colors.YELLOW)}")
+        return
+    
+    print(f"\n{colorize('=' * 70, Colors.RED)}")
+    print(f"{colorize('[!] DECRYPTED SAVED PASSWORDS', Colors.BOLD + Colors.RED)}")
+    print(f"{colorize('=' * 70, Colors.RED)}")
+    
+    for i, cred in enumerate(credentials, 1):
+        print(f"\n{colorize(f'[{i}]', Colors.YELLOW)} {colorize(cred.signon_realm, Colors.MAGENTA)}")
+        print(f"    {colorize('URL:', Colors.CYAN)} {cred.url}")
+        print(f"    {colorize('Username:', Colors.CYAN)} {colorize(cred.username, Colors.GREEN + Colors.BOLD)}")
+        print(f"    {colorize('Password:', Colors.CYAN)} {colorize(cred.password, Colors.RED + Colors.BOLD)}")
+        if cred.times_used:
+            print(f"    {colorize('Times Used:', Colors.CYAN)} {cred.times_used}")
+        if cred.date_last_used:
+            print(f"    {colorize('Last Used:', Colors.CYAN)} {cred.date_last_used}")
+    
+    print(f"\n{colorize('═' * 70, Colors.RED)}")
+    print(f"{colorize(f'Total: {len(credentials)} saved password(s) decrypted', Colors.BOLD + Colors.RED)}")
+    print(f"{colorize('═' * 70, Colors.RED)}\n")
+
+
+# =============================================================================
+# Terminal Print Functions for Specific Data Categories
+# =============================================================================
+
+def print_history_terminal(rows: list, limit: int = 50):
+    """Print browsing history to terminal."""
+    if not rows:
+        print(f"\n{colorize('[*] No browsing history found.', Colors.YELLOW)}")
+        return
+    
+    print(f"\n{colorize('=' * 80, Colors.CYAN)}")
+    print(f"{colorize('[BROWSING HISTORY]', Colors.BOLD + Colors.CYAN)} ({len(rows)} entries, showing {min(limit, len(rows))})")
+    print(f"{colorize('=' * 80, Colors.CYAN)}")
+    
+    for i, row in enumerate(rows[:limit], 1):
+        url = row.get('url', row.get('URL', 'N/A'))
+        title = row.get('title', row.get('Title', 'N/A'))
+        visit_time = row.get('visit_time', row.get('last_visit_time', row.get('Visit Time', 'N/A')))
+        visit_count = row.get('visit_count', row.get('Visit Count', ''))
+        
+        # Truncate long URLs and titles
+        if len(str(url)) > 70:
+            url = str(url)[:67] + "..."
+        if len(str(title)) > 50:
+            title = str(title)[:47] + "..."
+        
+        print(f"\n{colorize(f'[{i}]', Colors.YELLOW)} {colorize(str(title), Colors.WHITE)}")
+        print(f"    {colorize('URL:', Colors.CYAN)} {url}")
+        print(f"    {colorize('Time:', Colors.CYAN)} {visit_time}", end="")
+        if visit_count:
+            print(f"  |  {colorize('Visits:', Colors.CYAN)} {visit_count}")
+        else:
+            print()
+    
+    if len(rows) > limit:
+        print(f"\n{colorize(f'... and {len(rows) - limit} more entries', Colors.YELLOW)}")
+    
+    print(f"\n{colorize('─' * 80, Colors.CYAN)}")
+    print(f"{colorize(f'Total: {len(rows)} history entries', Colors.BOLD + Colors.CYAN)}")
+
+
+def print_cookies_terminal(rows: list, limit: int = 50):
+    """Print cookies to terminal."""
+    if not rows:
+        print(f"\n{colorize('[*] No cookies found.', Colors.YELLOW)}")
+        return
+    
+    print(f"\n{colorize('=' * 80, Colors.MAGENTA)}")
+    print(f"{colorize('[COOKIES]', Colors.BOLD + Colors.MAGENTA)} ({len(rows)} entries, showing {min(limit, len(rows))})")
+    print(f"{colorize('=' * 80, Colors.MAGENTA)}")
+    
+    for i, row in enumerate(rows[:limit], 1):
+        host = row.get('host', row.get('host_key', row.get('Host', 'N/A')))
+        name = row.get('name', row.get('Name', 'N/A'))
+        value = row.get('value', row.get('Value', ''))
+        expiry = row.get('expiry', row.get('expires_utc', row.get('Expiry', 'N/A')))
+        
+        # Truncate long values
+        if len(str(value)) > 40:
+            value = str(value)[:37] + "..."
+        
+        print(f"\n{colorize(f'[{i}]', Colors.YELLOW)} {colorize(str(host), Colors.WHITE)}")
+        print(f"    {colorize('Name:', Colors.CYAN)} {name}")
+        print(f"    {colorize('Value:', Colors.CYAN)} {colorize(str(value), Colors.GREEN)}")
+        print(f"    {colorize('Expires:', Colors.CYAN)} {expiry}")
+    
+    if len(rows) > limit:
+        print(f"\n{colorize(f'... and {len(rows) - limit} more cookies', Colors.YELLOW)}")
+    
+    print(f"\n{colorize('─' * 80, Colors.MAGENTA)}")
+    print(f"{colorize(f'Total: {len(rows)} cookies', Colors.BOLD + Colors.MAGENTA)}")
+
+
+def print_downloads_terminal(rows: list, limit: int = 30):
+    """Print downloads to terminal."""
+    if not rows:
+        print(f"\n{colorize('[*] No downloads found.', Colors.YELLOW)}")
+        return
+    
+    print(f"\n{colorize('=' * 80, Colors.GREEN)}")
+    print(f"{colorize('[DOWNLOADS]', Colors.BOLD + Colors.GREEN)} ({len(rows)} entries)")
+    print(f"{colorize('=' * 80, Colors.GREEN)}")
+    
+    for i, row in enumerate(rows[:limit], 1):
+        url = row.get('url', row.get('tab_url', row.get('URL', 'N/A')))
+        target = row.get('target', row.get('target_path', row.get('Target', 'N/A')))
+        start_time = row.get('start_time', row.get('Start Time', 'N/A'))
+        total_bytes = row.get('total_bytes', row.get('Total Bytes', ''))
+        
+        # Get filename from target path
+        if target and target != 'N/A':
+            filename = Path(str(target)).name
+        else:
+            filename = "Unknown"
+        
+        if len(str(url)) > 60:
+            url = str(url)[:57] + "..."
+        
+        print(f"\n{colorize(f'[{i}]', Colors.YELLOW)} {colorize(filename, Colors.WHITE)}")
+        print(f"    {colorize('URL:', Colors.CYAN)} {url}")
+        print(f"    {colorize('Path:', Colors.CYAN)} {target}")
+        print(f"    {colorize('Time:', Colors.CYAN)} {start_time}", end="")
+        if total_bytes:
+            size_mb = int(total_bytes) / (1024 * 1024) if str(total_bytes).isdigit() else 0
+            print(f"  |  {colorize('Size:', Colors.CYAN)} {size_mb:.2f} MB")
+        else:
+            print()
+    
+    if len(rows) > limit:
+        print(f"\n{colorize(f'... and {len(rows) - limit} more downloads', Colors.YELLOW)}")
+    
+    print(f"\n{colorize('─' * 80, Colors.GREEN)}")
+    print(f"{colorize(f'Total: {len(rows)} downloads', Colors.BOLD + Colors.GREEN)}")
+
+
+def print_bookmarks_terminal(rows: list, limit: int = 50):
+    """Print bookmarks to terminal."""
+    if not rows:
+        print(f"\n{colorize('[*] No bookmarks found.', Colors.YELLOW)}")
+        return
+    
+    print(f"\n{colorize('=' * 80, Colors.BLUE)}")
+    print(f"{colorize('[BOOKMARKS]', Colors.BOLD + Colors.BLUE)} ({len(rows)} entries)")
+    print(f"{colorize('=' * 80, Colors.BLUE)}")
+    
+    for i, row in enumerate(rows[:limit], 1):
+        title = row.get('title', row.get('Title', row.get('name', 'N/A')))
+        url = row.get('url', row.get('URL', 'N/A'))
+        folder = row.get('folder', row.get('parent_title', row.get('Folder', '')))
+        date_added = row.get('date_added', row.get('dateAdded', row.get('Date Added', '')))
+        
+        if len(str(title)) > 50:
+            title = str(title)[:47] + "..."
+        if len(str(url)) > 60:
+            url = str(url)[:57] + "..."
+        
+        print(f"\n{colorize(f'[{i}]', Colors.YELLOW)} {colorize(str(title), Colors.WHITE)}")
+        print(f"    {colorize('URL:', Colors.CYAN)} {url}")
+        if folder:
+            print(f"    {colorize('Folder:', Colors.CYAN)} {folder}")
+        if date_added:
+            print(f"    {colorize('Added:', Colors.CYAN)} {date_added}")
+    
+    if len(rows) > limit:
+        print(f"\n{colorize(f'... and {len(rows) - limit} more bookmarks', Colors.YELLOW)}")
+    
+    print(f"\n{colorize('─' * 80, Colors.BLUE)}")
+    print(f"{colorize(f'Total: {len(rows)} bookmarks', Colors.BOLD + Colors.BLUE)}")
+
+
+def print_autofill_terminal(rows: list, limit: int = 50):
+    """Print autofill/form data to terminal."""
+    if not rows:
+        print(f"\n{colorize('[*] No autofill/form data found.', Colors.YELLOW)}")
+        return
+    
+    print(f"\n{colorize('=' * 80, Colors.YELLOW)}")
+    print(f"{colorize('[AUTOFILL / FORM DATA]', Colors.BOLD + Colors.YELLOW)} ({len(rows)} entries)")
+    print(f"{colorize('=' * 80, Colors.YELLOW)}")
+    
+    for i, row in enumerate(rows[:limit], 1):
+        field = row.get('name', row.get('fieldname', row.get('Field', 'N/A')))
+        value = row.get('value', row.get('Value', 'N/A'))
+        use_count = row.get('count', row.get('use_count', row.get('timesUsed', '')))
+        
+        # Highlight sensitive fields
+        sensitive = any(kw in str(field).lower() for kw in ['email', 'phone', 'address', 'card', 'password', 'ssn', 'name'])
+        field_color = Colors.RED if sensitive else Colors.WHITE
+        
+        if len(str(value)) > 50:
+            value = str(value)[:47] + "..."
+        
+        print(f"\n{colorize(f'[{i}]', Colors.YELLOW)} {colorize(str(field), field_color)}")
+        print(f"    {colorize('Value:', Colors.CYAN)} {colorize(str(value), Colors.GREEN)}")
+        if use_count:
+            print(f"    {colorize('Used:', Colors.CYAN)} {use_count} times")
+    
+    if len(rows) > limit:
+        print(f"\n{colorize(f'... and {len(rows) - limit} more entries', Colors.YELLOW)}")
+    
+    print(f"\n{colorize('─' * 80, Colors.YELLOW)}")
+    print(f"{colorize(f'Total: {len(rows)} autofill entries', Colors.BOLD + Colors.YELLOW)}")
+
+
+def print_extensions_terminal(rows: list):
+    """Print extensions to terminal."""
+    if not rows:
+        print(f"\n{colorize('[*] No extensions found.', Colors.YELLOW)}")
+        return
+    
+    print(f"\n{colorize('=' * 80, Colors.MAGENTA)}")
+    print(f"{colorize('[EXTENSIONS]', Colors.BOLD + Colors.MAGENTA)} ({len(rows)} installed)")
+    print(f"{colorize('=' * 80, Colors.MAGENTA)}")
+    
+    for i, row in enumerate(rows, 1):
+        name = row.get('name', row.get('Name', 'N/A'))
+        version = row.get('version', row.get('Version', ''))
+        enabled = row.get('enabled', row.get('Enabled', True))
+        description = row.get('description', row.get('Description', ''))
+        
+        status = colorize('✓ Enabled', Colors.GREEN) if enabled else colorize('✗ Disabled', Colors.RED)
+        
+        if len(str(description)) > 60:
+            description = str(description)[:57] + "..."
+        
+        print(f"\n{colorize(f'[{i}]', Colors.YELLOW)} {colorize(str(name), Colors.WHITE)} {colorize(f'v{version}', Colors.CYAN) if version else ''}")
+        print(f"    {colorize('Status:', Colors.CYAN)} {status}")
+        if description:
+            print(f"    {colorize('Description:', Colors.CYAN)} {description}")
+    
+    print(f"\n{colorize('─' * 80, Colors.MAGENTA)}")
+    print(f"{colorize(f'Total: {len(rows)} extensions', Colors.BOLD + Colors.MAGENTA)}")
+
+
+def print_search_queries_terminal(rows: list, limit: int = 50):
+    """Print search queries to terminal."""
+    if not rows:
+        print(f"\n{colorize('[*] No search queries found.', Colors.YELLOW)}")
+        return
+    
+    print(f"\n{colorize('=' * 80, Colors.CYAN)}")
+    print(f"{colorize('[SEARCH QUERIES]', Colors.BOLD + Colors.CYAN)} ({len(rows)} entries)")
+    print(f"{colorize('=' * 80, Colors.CYAN)}")
+    
+    for i, row in enumerate(rows[:limit], 1):
+        query = row.get('query', row.get('term', row.get('search_term', row.get('Query', 'N/A'))))
+        search_time = row.get('time', row.get('search_time', row.get('Time', '')))
+        
+        print(f"  {colorize(f'[{i}]', Colors.YELLOW)} {colorize(str(query), Colors.WHITE)}")
+        if search_time:
+            print(f"      {colorize('Time:', Colors.CYAN)} {search_time}")
+    
+    if len(rows) > limit:
+        print(f"\n{colorize(f'... and {len(rows) - limit} more queries', Colors.YELLOW)}")
+    
+    print(f"\n{colorize('─' * 80, Colors.CYAN)}")
+    print(f"{colorize(f'Total: {len(rows)} search queries', Colors.BOLD + Colors.CYAN)}")
+
+
+def print_permissions_terminal(rows: list):
+    """Print site permissions to terminal."""
+    if not rows:
+        print(f"\n{colorize('[*] No permissions found.', Colors.YELLOW)}")
+        return
+    
+    print(f"\n{colorize('=' * 80, Colors.RED)}")
+    print(f"{colorize('[SITE PERMISSIONS]', Colors.BOLD + Colors.RED)} ({len(rows)} entries)")
+    print(f"{colorize('=' * 80, Colors.RED)}")
+    
+    for i, row in enumerate(rows, 1):
+        origin = row.get('origin', row.get('host', row.get('Origin', 'N/A')))
+        permission = row.get('type', row.get('permission', row.get('Permission', 'N/A')))
+        setting = row.get('permission', row.get('setting', row.get('Setting', '')))
+        
+        # Color code permissions
+        perm_color = Colors.RED if any(p in str(permission).lower() for p in ['camera', 'microphone', 'location', 'notification']) else Colors.WHITE
+        
+        print(f"\n{colorize(f'[{i}]', Colors.YELLOW)} {colorize(str(origin), Colors.WHITE)}")
+        print(f"    {colorize('Permission:', Colors.CYAN)} {colorize(str(permission), perm_color)}")
+        if setting:
+            print(f"    {colorize('Setting:', Colors.CYAN)} {setting}")
+    
+    print(f"\n{colorize('─' * 80, Colors.RED)}")
+    print(f"{colorize(f'Total: {len(rows)} permissions', Colors.BOLD + Colors.RED)}")
+
+
+def print_extracted_data_terminal(data: dict, categories: list):
+    """Print extracted data to terminal based on selected categories.
+    
+    Args:
+        data: Dictionary of extracted data by category
+        categories: List of categories to print (or ['all'] for everything)
+    """
+    extract_all = 'all' in categories
+    
+    # Map category names to print functions and data keys
+    category_handlers = {
+        'history': (print_history_terminal, ['History', 'browsing_history', 'recent_24h']),
+        'cookies': (print_cookies_terminal, ['Cookies', 'all_cookies', 'cookies_by_domain']),
+        'downloads': (print_downloads_terminal, ['Downloads', 'all_downloads', 'downloads']),
+        'bookmarks': (print_bookmarks_terminal, ['Bookmarks', 'bookmarks']),
+        'autofill': (print_autofill_terminal, ['Autofill', 'all_autofill', 'all_form_history', 'formhistory']),
+        'forms': (print_autofill_terminal, ['Forms', 'all_form_history', 'formhistory']),
+        'extensions': (print_extensions_terminal, ['Extensions', 'extensions']),
+        'search': (print_search_queries_terminal, ['SearchQueries', 'search_queries']),
+        'permissions': (print_permissions_terminal, ['Permissions', 'all_permissions', 'granted_permissions']),
+    }
+    
+    printed_any = False
+    
+    for cat_name, (print_func, data_keys) in category_handlers.items():
+        if extract_all or cat_name in categories:
+            # Find matching data
+            for key in data_keys:
+                if key in data:
+                    rows = data[key]
+                    if isinstance(rows, dict):
+                        # Nested structure - flatten
+                        for sub_key, sub_rows in rows.items():
+                            if isinstance(sub_rows, list) and sub_rows:
+                                print_func(sub_rows)
+                                printed_any = True
+                                break
+                    elif isinstance(rows, list) and rows:
+                        print_func(rows)
+                        printed_any = True
+                        break
+    
+    if not printed_any:
+        print(f"\n{colorize('[*] No data found for selected categories.', Colors.YELLOW)}")
 
 
 def print_credentials_summary(credentials: list):
@@ -165,7 +651,7 @@ def prompt_master_password() -> str:
 def print_goodbye():
     """Print goodbye message."""
     print(f"\n{colorize('=' * 70, Colors.CYAN)}")
-    print(f"{colorize('Thank you for using Firefox Forensics Tool!', Colors.BOLD + Colors.CYAN)}")
+    print(f"{colorize('Thank you for using Browser Forensics Tool!', Colors.BOLD + Colors.CYAN)}")
     print(f"{colorize('   Goodbye!', Colors.CYAN)}")
     print(f"{colorize('=' * 70, Colors.CYAN)}\n")
 
@@ -1088,14 +1574,27 @@ def main():
     parser.add_argument(
         "profile",
         nargs="?",
-        help="Path to Firefox profile directory (optional - will auto-detect if not provided)",
+        help="Path to browser profile directory (optional - will auto-detect if not provided)",
+    )
+
+    parser.add_argument(
+        "--browser", "-b",
+        choices=["firefox", "chrome", "chromium", "edge", "brave", "opera", "vivaldi", "auto"],
+        default="auto",
+        help="Browser to extract from (default: auto-detect all browsers)",
+    )
+
+    parser.add_argument(
+        "--list-browsers",
+        action="store_true",
+        help="List all detected browsers and their profiles",
     )
 
     parser.add_argument(
         "--output",
         "-o",
         default=None,
-        help="Output directory name (default: ~/Downloads/firefox_forensics_output)",
+        help="Output directory name (default: ~/Downloads/<browser>_forensics_output)",
     )
 
     parser.add_argument(
@@ -1111,6 +1610,27 @@ def main():
         "-c",
         action="store_true",
         help="Copy source database files as read-only artifacts (forensic mode)",
+    )
+
+    parser.add_argument(
+        "--extract", "-e",
+        nargs="+",
+        choices=["history", "cookies", "passwords", "downloads", "bookmarks", 
+                 "autofill", "extensions", "forms", "permissions", "search", "all"],
+        default=["all"],
+        help="Data categories to extract (default: all). Can specify multiple: -e history cookies",
+    )
+
+    parser.add_argument(
+        "--print-only",
+        action="store_true",
+        help="Print extracted data to terminal only (no file output)",
+    )
+
+    parser.add_argument(
+        "--no-passwords",
+        action="store_true",
+        help="Skip password decryption",
     )
 
     parser.add_argument(
@@ -1158,83 +1678,179 @@ def main():
     log_level = logging.DEBUG if args.verbose else logging.WARNING if args.quiet else logging.INFO
     logger = setup_logging(log_level)
 
+    print_banner()
+
+    # Handle --list-browsers
+    if args.list_browsers:
+        print_system_info()
+        print(f"\n{colorize('[*] Scanning for installed browsers...', Colors.CYAN)}")
+        installations = detect_all_browsers()
+        browser_filter = args.browser if args.browser != "auto" else None
+        print_detected_browsers_ui(installations, filter_browser=browser_filter)
+        return 0
+
     # Handle --check-env
     if args.check_env:
-        print_banner()
+        print(f"\n{colorize('Environment Check:', Colors.CYAN)}")
+        
+        # Check Chromium requirements
+        print(f"\n{colorize('Chromium Browsers:', Colors.YELLOW)}")
+        reqs_met, missing = check_decryption_requirements()
+        if reqs_met:
+            print(f"  {colorize('✓', Colors.GREEN)} All requirements met")
+        else:
+            print(f"  {colorize('✗', Colors.RED)} Missing: {', '.join(missing)}")
+        
+        # Check Firefox requirements
+        print(f"\n{colorize('Firefox:', Colors.YELLOW)}")
         profile = Path(args.profile) if args.profile else None
-        ok = run_environment_check(profile)
-        return 0 if ok else 1
+        run_environment_check(profile)
+        return 0
 
     # Handle --list-queries
     if args.list_queries:
-        print_banner()
         print(f"{colorize('Available Forensic Queries:', Colors.CYAN)}\n")
+        print(f"\n{colorize('Firefox Queries:', Colors.YELLOW)}")
         for db_name, queries in QUERY_REGISTRY.items():
-            print(f"{colorize(db_name, Colors.YELLOW)}:")
+            print(f"  {colorize(db_name, Colors.WHITE)}:")
             for query_name in queries:
-                print(f"  - {query_name}")
-            print()
+                print(f"    - {query_name}")
+        
+        print(f"\n{colorize('Chromium Queries:', Colors.YELLOW)}")
+        from chromium_queries import CHROMIUM_QUERY_REGISTRY
+        for category, config in CHROMIUM_QUERY_REGISTRY.items():
+            print(f"  {colorize(category, Colors.WHITE)} ({config['database']}):")
+            for query_name in config['queries']:
+                print(f"    - {query_name}")
         return 0
 
+    # Determine browser filter
+    browser_filter = args.browser if args.browser != "auto" else None
+    
     # Handle profile path - auto-detect if not provided
     if args.profile:
-        # User provided profile path
-        try:
-            profile_path = expand_firefox_path(args.profile)
-        except Exception as e:
-            logger.error(f"Invalid profile path: {e}")
+        # User provided profile path directly
+        profile_path = Path(args.profile).expanduser().resolve()
+        if not profile_path.exists():
+            logger.error(f"Profile path does not exist: {profile_path}")
             return 1
+        
+        # Try to detect browser type from path
+        detected = detect_browser_from_path(str(profile_path))
+        if detected:
+            browser_type = detected.browser_type
+            browser_family = detected.family
+            profile_display = detected.display_name
+        else:
+            # Fallback: try to determine from directory structure
+            if (profile_path / "places.sqlite").exists():
+                browser_family = BrowserFamily.GECKO
+                browser_type = BrowserType.FIREFOX
+                profile_display = profile_path.name
+            elif (profile_path / "History").exists() or (profile_path / "Cookies").exists():
+                browser_family = BrowserFamily.CHROMIUM
+                browser_type = BrowserType.CHROMIUM
+                profile_display = profile_path.name
+            else:
+                logger.error("Could not determine browser type from profile path")
+                return 1
+        
+        selected_profile = BrowserProfile(
+            path=profile_path,
+            name=profile_path.name,
+            display_name=profile_display,
+            browser_type=browser_type,
+            family=browser_family,
+        )
     else:
-        # Auto-detect: show profile selection
-        print_banner()
-        profile_path = prompt_profile_selection()
-        if profile_path is None:
+        # Auto-detect: show browser selection
+        selected_profile = prompt_browser_selection(filter_browser=browser_filter)
+        if selected_profile is None:
             print_goodbye()
             return 0
 
     # Track if user specified output path
     output_provided = args.output is not None
+    browser_name = selected_profile.browser_type.value.lower().replace(" ", "_")
     if args.output:
         output_dir = Path(args.output)
     else:
-        output_dir = Path.home() / "Downloads" / "firefox_forensics_output"
+        output_dir = Path.home() / "Downloads" / f"{browser_name}_forensics_output"
 
     # Determine which extraction mode to use
     use_forensic_mode = (args.format == 'forensic' or args.format == 'all') and not args.legacy
+    profile_path = selected_profile.profile_path
+    
+    # Get extraction categories
+    extract_categories = args.extract if hasattr(args, 'extract') else ['all']
+    print_only = args.print_only if hasattr(args, 'print_only') else False
 
-    # Run extraction
+    # Run extraction based on browser family
     try:
         interactive = not args.no_interactive
+        skip_passwords = args.no_passwords
         
-        if use_forensic_mode:
-            # Use new DFIR-compliant forensic extraction
-            success = extract_profile_forensic(
-                profile_path,
+        # Check if passwords should be included based on extract categories
+        if 'passwords' not in extract_categories and 'all' not in extract_categories:
+            skip_passwords = True
+        
+        if selected_profile.browser_family == BrowserFamily.CHROMIUM:
+            # Chromium-based browser extraction
+            success = extract_chromium_forensics(
+                selected_profile,
                 output_dir,
                 logger,
                 interactive=interactive,
                 copy_artifacts=args.copy_artifacts,
                 output_provided=output_provided,
+                skip_passwords=skip_passwords,
+                extract_categories=extract_categories,
+                print_only=print_only,
             )
-        else:
-            # Use legacy extraction mode
-            format_provided = args.format != 'all'
-            if args.format == 'all':
-                formats = ['html', 'csv', 'md']
-            elif args.format == 'forensic':
-                formats = ['html', 'csv', 'md']
+        elif selected_profile.browser_family == BrowserFamily.GECKO:
+            # Firefox/Gecko browser extraction
+            if print_only or extract_categories != ['all']:
+                # Use quick extraction for print-only or specific categories
+                success = extract_firefox_quick(
+                    profile_path,
+                    output_dir,
+                    logger,
+                    extract_categories=extract_categories,
+                    print_only=print_only,
+                    skip_passwords=skip_passwords,
+                )
+            elif use_forensic_mode:
+                # Use new DFIR-compliant forensic extraction
+                success = extract_profile_forensic(
+                    profile_path,
+                    output_dir,
+                    logger,
+                    interactive=interactive,
+                    copy_artifacts=args.copy_artifacts,
+                    output_provided=output_provided,
+                )
             else:
-                formats = [args.format]
-            
-            success = extract_profile(
-                profile_path,
-                output_dir,
-                logger,
-                formats=formats,
-                interactive=interactive,
-                format_provided=format_provided,
-                output_provided=output_provided,
-            )
+                # Use legacy extraction mode
+                format_provided = args.format != 'all'
+                if args.format == 'all':
+                    formats = ['html', 'csv', 'md']
+                elif args.format == 'forensic':
+                    formats = ['html', 'csv', 'md']
+                else:
+                    formats = [args.format]
+                
+                success = extract_profile(
+                    profile_path,
+                    output_dir,
+                    logger,
+                    formats=formats,
+                    interactive=interactive,
+                    format_provided=format_provided,
+                    output_provided=output_provided,
+                )
+        else:
+            logger.error(f"Unsupported browser family: {selected_profile.browser_family}")
+            return 1
         
         return 0 if success else 1
         
@@ -1246,6 +1862,418 @@ def main():
         logger.exception(f"Unexpected error during extraction: {e}")
         print_goodbye()
         return 1
+
+
+def extract_chromium_forensics(
+    profile: BrowserProfile,
+    output_dir: Path,
+    logger: logging.Logger,
+    interactive: bool = True,
+    copy_artifacts: bool = False,
+    output_provided: bool = False,
+    skip_passwords: bool = False,
+    extract_categories: list = None,
+    print_only: bool = False,
+) -> bool:
+    """Extract forensic data from a Chromium-based browser profile."""
+    from chromium_extractor import ChromiumDatabaseExtractor, ChromiumJSONExtractor
+    from chromium_queries import CHROMIUM_QUERY_REGISTRY
+    from chromium_decrypt import decrypt_chromium_passwords, check_decryption_requirements
+    
+    if extract_categories is None:
+        extract_categories = ['all']
+    
+    extract_all = 'all' in extract_categories
+    
+    # Map categories to Chromium query categories
+    category_map = {
+        'history': ['History'],
+        'cookies': ['Cookies'],
+        'downloads': ['Downloads'],
+        'autofill': ['Autofill'],
+        'forms': ['Autofill'],
+        'search': ['SearchEngines'],
+        'bookmarks': ['Bookmarks'],
+        'extensions': ['Extensions'],
+        'passwords': ['Logins'],
+    }
+    
+    profile_path = profile.profile_path
+    browser_name = profile.browser_type.value
+    profile_name = profile.display_name.split(" - ", 1)[1] if " - " in profile.display_name else profile.profile_name
+    
+    print(f"\n{colorize('=' * 60, Colors.CYAN)}")
+    print(f"{colorize(f'Extracting from {browser_name}', Colors.CYAN)}")
+    print(f"{colorize(f'Profile: {profile_name}', Colors.WHITE)}")
+    print(f"{colorize(f'Path: {profile_path}', Colors.WHITE)}")
+    if not extract_all:
+        print(f"{colorize(f'Categories: {", ".join(extract_categories)}', Colors.YELLOW)}")
+    print(f"{colorize('=' * 60, Colors.CYAN)}\n")
+    
+    # Confirm extraction
+    if interactive and not print_only:
+        confirm = input(f"{colorize('Proceed with extraction? [Y/n]: ', Colors.YELLOW)}").strip().lower()
+        if confirm == 'n':
+            print(f"{colorize('Extraction cancelled.', Colors.YELLOW)}")
+            return False
+    
+    # Create output directory (only if not print_only)
+    if not print_only:
+        if not output_provided:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = output_dir.parent / f"{output_dir.name}_{timestamp}"
+        
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n{colorize('[*] Output directory:', Colors.CYAN)} {output_dir}")
+    
+    all_data = {}
+    
+    # Determine which categories to extract from database
+    db_categories_to_extract = set()
+    if extract_all:
+        db_categories_to_extract = set(CHROMIUM_QUERY_REGISTRY.keys())
+    else:
+        for cat in extract_categories:
+            if cat in category_map:
+                db_categories_to_extract.update(category_map[cat])
+    
+    # Extract database data
+    print(f"\n{colorize('[*] Extracting database artifacts...', Colors.CYAN)}")
+    
+    with ChromiumDatabaseExtractor(profile) as extractor:
+        for category, config in CHROMIUM_QUERY_REGISTRY.items():
+            # Skip if not in requested categories
+            if category not in db_categories_to_extract:
+                continue
+                
+            db_name = config['database']
+            print(f"  {colorize('•', Colors.WHITE)} {category} ({db_name})...", end=" ")
+            
+            category_data = {}
+            for query_name, query_info in config['queries'].items():
+                try:
+                    # query_info is a dict with 'name', 'query', 'description'
+                    query_sql = query_info['query'] if isinstance(query_info, dict) else query_info
+                    rows, count = extractor.run_query(db_name, query_sql)
+                    if rows:
+                        category_data[query_name] = rows
+                except Exception as e:
+                    logger.debug(f"Query {query_name} failed: {e}")
+            
+            if category_data:
+                all_data[category] = category_data
+                total_rows = sum(len(v) for v in category_data.values())
+                print(f"{colorize(f'{total_rows} records', Colors.GREEN)}")
+            else:
+                print(f"{colorize('no data', Colors.YELLOW)}")
+    
+    # Extract JSON data (bookmarks, extensions) if requested
+    if extract_all or 'bookmarks' in extract_categories or 'extensions' in extract_categories:
+        print(f"\n{colorize('[*] Extracting JSON artifacts...', Colors.CYAN)}")
+        
+        json_extractor = ChromiumJSONExtractor(profile)
+        
+        # Bookmarks
+        if extract_all or 'bookmarks' in extract_categories:
+            print(f"  {colorize('•', Colors.WHITE)} Bookmarks...", end=" ")
+            bookmarks = json_extractor.flatten_bookmarks()
+            if bookmarks:
+                all_data['Bookmarks'] = {'bookmarks': bookmarks}
+                print(f"{colorize(f'{len(bookmarks)} bookmarks', Colors.GREEN)}")
+            else:
+                print(f"{colorize('no data', Colors.YELLOW)}")
+        
+        # Extensions
+        if extract_all or 'extensions' in extract_categories:
+            print(f"  {colorize('•', Colors.WHITE)} Extensions...", end=" ")
+            extensions = json_extractor.get_extensions()
+            if extensions:
+                all_data['Extensions'] = {'extensions': extensions}
+                print(f"{colorize(f'{len(extensions)} extensions', Colors.GREEN)}")
+            else:
+                print(f"{colorize('no data', Colors.YELLOW)}")
+    
+    # Password decryption
+    if not skip_passwords and (extract_all or 'passwords' in extract_categories):
+        print(f"\n{colorize('[*] Attempting password decryption...', Colors.CYAN)}")
+        reqs_met, missing = check_decryption_requirements()
+        
+        if reqs_met:
+            credentials = decrypt_chromium_passwords(profile_path)
+            if credentials:
+                all_data['Credentials'] = {'passwords': credentials}
+                print(f"  {colorize('✓', Colors.GREEN)} Decrypted {len(credentials)} credentials")
+                
+                # Display credentials
+                print_credentials_chromium(credentials)
+            else:
+                print(f"  {colorize('•', Colors.YELLOW)} No saved passwords found")
+        else:
+            print(f"  {colorize('✗', Colors.RED)} Missing requirements: {', '.join(missing)}")
+    elif skip_passwords and (extract_all or 'passwords' in extract_categories):
+        print(f"\n{colorize('[*] Password decryption skipped (--no-passwords)', Colors.YELLOW)}")
+    
+    # Print data to terminal if requested
+    if print_only or not extract_all:
+        # Flatten all_data for terminal printing
+        flat_data = {}
+        for category, queries in all_data.items():
+            for query_name, rows in queries.items():
+                flat_data[query_name] = rows
+                flat_data[category] = rows  # Also add by category name
+        
+        print_extracted_data_terminal(flat_data, extract_categories)
+    
+    # If print_only, skip file generation
+    if print_only:
+        print(f"\n{colorize('=' * 60, Colors.GREEN)}")
+        print(f"{colorize('Data printed to terminal (--print-only mode)', Colors.GREEN)}")
+        print(f"{colorize('=' * 60, Colors.GREEN)}")
+        print_goodbye()
+        return True
+    
+    # Copy artifacts if requested
+    if copy_artifacts:
+        print(f"\n{colorize('[*] Copying source artifacts...', Colors.CYAN)}")
+        artifacts_dir = output_dir / "artifacts"
+        artifacts_dir.mkdir(exist_ok=True)
+        
+        artifact_files = [
+            "History", "Cookies", "Login Data", "Web Data",
+            "Bookmarks", "Preferences", "Secure Preferences",
+            "Local State", "Extensions"
+        ]
+        
+        for artifact in artifact_files:
+            src = profile_path / artifact
+            if src.exists():
+                dst = artifacts_dir / artifact
+                try:
+                    if src.is_file():
+                        shutil.copy2(src, dst)
+                        os.chmod(dst, 0o444)  # Read-only
+                        print(f"  {colorize('✓', Colors.GREEN)} {artifact}")
+                    elif src.is_dir():
+                        shutil.copytree(src, dst)
+                        print(f"  {colorize('✓', Colors.GREEN)} {artifact}/ (directory)")
+                except Exception as e:
+                    print(f"  {colorize('✗', Colors.RED)} {artifact}: {e}")
+    
+    # Generate reports
+    print(f"\n{colorize('[*] Generating forensic reports...', Colors.CYAN)}")
+    
+    # Generate CSV reports
+    csv_dir = output_dir / "csv"
+    csv_dir.mkdir(exist_ok=True)
+    
+    for category, queries in all_data.items():
+        for query_name, rows in queries.items():
+            if rows and isinstance(rows, list) and len(rows) > 0:
+                csv_path = csv_dir / f"{category}_{query_name}.csv"
+                try:
+                    if isinstance(rows[0], dict):
+                        import csv
+                        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+                            writer.writeheader()
+                            writer.writerows(rows)
+                        print(f"  {colorize('✓', Colors.GREEN)} {csv_path.name}")
+                except Exception as e:
+                    logger.debug(f"CSV export failed for {category}/{query_name}: {e}")
+    
+    # Generate summary report
+    summary_path = output_dir / "extraction_summary.txt"
+    with open(summary_path, 'w') as f:
+        f.write(f"Browser Forensics Extraction Summary\n")
+        f.write(f"{'=' * 50}\n\n")
+        f.write(f"Browser: {browser_name}\n")
+        f.write(f"Profile: {profile_name}\n")
+        f.write(f"Profile Path: {profile_path}\n")
+        f.write(f"Extraction Time: {datetime.now().isoformat()}\n")
+        f.write(f"Output Directory: {output_dir}\n")
+        f.write(f"Categories Extracted: {', '.join(extract_categories)}\n\n")
+        
+        f.write(f"Extracted Data Summary:\n")
+        f.write(f"{'-' * 30}\n")
+        for category, queries in all_data.items():
+            total = sum(len(v) if isinstance(v, list) else 1 for v in queries.values())
+            f.write(f"  {category}: {total} records\n")
+    
+    print(f"  {colorize('✓', Colors.GREEN)} extraction_summary.txt")
+    
+    print(f"\n{colorize('=' * 60, Colors.GREEN)}")
+    print(f"{colorize('Extraction Complete!', Colors.GREEN)}")
+    print(f"{colorize(f'Output: {output_dir}', Colors.WHITE)}")
+    print(f"{colorize('=' * 60, Colors.GREEN)}")
+    
+    print_goodbye()
+    return True
+
+
+def extract_firefox_quick(
+    profile_path: Path,
+    output_dir: Path,
+    logger: logging.Logger,
+    extract_categories: list = None,
+    print_only: bool = False,
+    skip_passwords: bool = False,
+) -> bool:
+    """Quick extraction for Firefox with specific categories and terminal print support."""
+    from extractor import FirefoxDatabaseExtractor
+    from queries import QUERY_REGISTRY
+    
+    if extract_categories is None:
+        extract_categories = ['all']
+    
+    extract_all = 'all' in extract_categories
+    
+    # Map categories to Firefox database/query mappings
+    category_map = {
+        'history': [('places.sqlite', ['browsing_history', 'recent_24h', 'top_sites'])],
+        'cookies': [('cookies.sqlite', ['all_cookies', 'auth_tokens', 'persistent_sessions'])],
+        'downloads': [('places.sqlite', ['downloads'])],
+        'bookmarks': [('places.sqlite', ['bookmarks'])],
+        'forms': [('formhistory.sqlite', ['all_form_history', 'sensitive_fields'])],
+        'autofill': [('formhistory.sqlite', ['all_form_history', 'email_addresses', 'usernames'])],
+        'search': [('formhistory.sqlite', ['search_queries']), ('places.sqlite', ['search_queries'])],
+        'permissions': [('permissions.sqlite', ['all_permissions', 'granted_permissions'])],
+    }
+    
+    print(f"\n{colorize('=' * 60, Colors.CYAN)}")
+    print(f"{colorize('Extracting from Firefox', Colors.CYAN)}")
+    print(f"{colorize(f'Profile: {profile_path.name}', Colors.WHITE)}")
+    print(f"{colorize(f'Path: {profile_path}', Colors.WHITE)}")
+    if not extract_all:
+        print(f"{colorize(f'Categories: {", ".join(extract_categories)}', Colors.YELLOW)}")
+    print(f"{colorize('=' * 60, Colors.CYAN)}\n")
+    
+    all_data = {}
+    
+    # Determine which queries to run
+    queries_to_run = {}  # db_name -> [query_names]
+    
+    if extract_all:
+        for db_name, queries in QUERY_REGISTRY.items():
+            queries_to_run[db_name] = list(queries.keys())
+    else:
+        for cat in extract_categories:
+            if cat in category_map:
+                for db_name, query_names in category_map[cat]:
+                    if db_name not in queries_to_run:
+                        queries_to_run[db_name] = []
+                    queries_to_run[db_name].extend(query_names)
+    
+    # Extract data
+    print(f"{colorize('[*] Extracting database artifacts...', Colors.CYAN)}")
+    
+    extractor = FirefoxDatabaseExtractor(profile_path)
+    
+    for db_name, query_names in queries_to_run.items():
+        if db_name not in QUERY_REGISTRY:
+            continue
+        
+        db_path = profile_path / db_name
+        if not db_path.exists():
+            continue
+            
+        print(f"  {colorize('•', Colors.WHITE)} {db_name}...", end=" ")
+        
+        db_data = {}
+        for query_name in set(query_names):  # Deduplicate
+            if query_name in QUERY_REGISTRY.get(db_name, {}):
+                try:
+                    query_sql = QUERY_REGISTRY[db_name][query_name]
+                    rows, count = extractor.run_forensic_query(db_path, query_sql)
+                    if rows:
+                        db_data[query_name] = rows
+                except Exception as e:
+                    logger.debug(f"Query {query_name} failed: {e}")
+        
+        if db_data:
+            all_data[db_name] = db_data
+            total_rows = sum(len(v) for v in db_data.values())
+            print(f"{colorize(f'{total_rows} records', Colors.GREEN)}")
+        else:
+            print(f"{colorize('no data', Colors.YELLOW)}")
+    
+    # Password decryption
+    if not skip_passwords and (extract_all or 'passwords' in extract_categories):
+        print(f"\n{colorize('[*] Attempting password decryption...', Colors.CYAN)}")
+        try:
+            from nss_decrypt import decrypt_firefox_passwords, check_master_password_required
+            
+            if check_master_password_required(profile_path):
+                password = prompt_master_password()
+                if not password:
+                    print(f"  {colorize('•', Colors.YELLOW)} Password decryption cancelled")
+                else:
+                    passwords = decrypt_firefox_passwords(profile_path, master_password=password)
+                    if passwords:
+                        all_data['passwords'] = {'decrypted': passwords}
+                        print(f"  {colorize('✓', Colors.GREEN)} Decrypted {len(passwords)} passwords")
+                        print_decrypted_passwords(passwords)
+            else:
+                passwords = decrypt_firefox_passwords(profile_path)
+                if passwords:
+                    all_data['passwords'] = {'decrypted': passwords}
+                    print(f"  {colorize('✓', Colors.GREEN)} Decrypted {len(passwords)} passwords")
+                    print_decrypted_passwords(passwords)
+                else:
+                    print(f"  {colorize('•', Colors.YELLOW)} No saved passwords found")
+        except Exception as e:
+            logger.debug(f"Password decryption failed: {e}")
+            print(f"  {colorize('✗', Colors.RED)} Password decryption failed: {e}")
+    
+    # Flatten data for terminal printing
+    flat_data = {}
+    for db_name, queries in all_data.items():
+        if isinstance(queries, dict):
+            for query_name, rows in queries.items():
+                flat_data[query_name] = rows
+    
+    # Print to terminal
+    print_extracted_data_terminal(flat_data, extract_categories)
+    
+    if print_only:
+        print(f"\n{colorize('=' * 60, Colors.GREEN)}")
+        print(f"{colorize('Data printed to terminal (--print-only mode)', Colors.GREEN)}")
+        print(f"{colorize('=' * 60, Colors.GREEN)}")
+        print_goodbye()
+        return True
+    
+    # Save to files
+    if not output_dir.exists():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = output_dir.parent / f"{output_dir.name}_{timestamp}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\n{colorize('[*] Saving to files...', Colors.CYAN)}")
+    print(f"  {colorize('Output:', Colors.WHITE)} {output_dir}")
+    
+    # Save CSV files
+    csv_dir = output_dir / "csv"
+    csv_dir.mkdir(exist_ok=True)
+    
+    import csv as csv_module
+    for query_name, rows in flat_data.items():
+        if rows and isinstance(rows, list) and len(rows) > 0 and isinstance(rows[0], dict):
+            csv_path = csv_dir / f"{query_name}.csv"
+            try:
+                with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv_module.DictWriter(f, fieldnames=rows[0].keys())
+                    writer.writeheader()
+                    writer.writerows(rows)
+                print(f"  {colorize('✓', Colors.GREEN)} {csv_path.name}")
+            except Exception as e:
+                logger.debug(f"CSV export failed: {e}")
+    
+    print(f"\n{colorize('=' * 60, Colors.GREEN)}")
+    print(f"{colorize('Extraction Complete!', Colors.GREEN)}")
+    print(f"{colorize(f'Output: {output_dir}', Colors.WHITE)}")
+    print(f"{colorize('=' * 60, Colors.GREEN)}")
+    
+    print_goodbye()
+    return True
 
 
 if __name__ == "__main__":

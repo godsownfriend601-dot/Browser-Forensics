@@ -1,10 +1,22 @@
-# Firefox Forensics Extraction Tool
+# Browser Forensics Extraction Tool
 # Python Dependencies
 #
-# This tool primarily uses Python standard library modules.
-# No pip packages are required for basic functionality.
+# Supports: Firefox, Chrome, Edge, Brave, Opera, Vivaldi
 #
-# Standard library modules used:
+# ============================================================================
+# REQUIRED DEPENDENCIES
+# ============================================================================
+#
+# For Chromium-based browsers (Chrome, Edge, Brave, etc.) password decryption:
+pycryptodome>=3.19.0
+
+# For Linux GNOME Keyring access (optional, for Chrome password decryption):
+# secretstorage>=3.3.0  # Uncomment if using GNOME desktop
+
+# ============================================================================
+# STANDARD LIBRARY MODULES USED
+# ============================================================================
+#
 # - sqlite3: SQLite database access
 # - json: JSON file parsing
 # - csv: CSV export
@@ -14,19 +26,21 @@
 # - datetime: Timestamp conversion
 # - dataclasses: Data structures
 # - typing: Type hints
-# - ctypes: NSS library bindings (for password decryption)
+# - ctypes: DPAPI/NSS library bindings (for password decryption)
 # - subprocess: System commands
 # - tempfile: Temporary files
 # - shutil: File operations
 # - base64: Base64 decoding
 #
 # ============================================================================
-# SYSTEM REQUIREMENTS (not pip packages)
+# SYSTEM REQUIREMENTS
 # ============================================================================
 #
 # Python 3.9+ (tested on 3.9, 3.10, 3.11, 3.12, 3.13)
 #
-# libnss3 - Mozilla NSS library (for password decryption)
+# FOR FIREFOX PASSWORD DECRYPTION:
+# --------------------------------
+# libnss3 - Mozilla NSS library
 #   Install with your system package manager:
 #
 #   Arch Linux / Manjaro:
@@ -44,24 +58,52 @@
 #   macOS (Homebrew):
 #     brew install nss
 #
+# FOR CHROMIUM PASSWORD DECRYPTION:
+# ---------------------------------
+# Windows: No additional system requirements (uses DPAPI)
+# Linux: pycryptodome (pip install pycryptodome)
+# macOS: pycryptodome + Keychain access
+#
 # ============================================================================
 # QUICK SETUP
 # ============================================================================
 #
-# Option 1: Use the setup script (recommended)
+# Option 1: Use pip (recommended)
+#   pip install -r requirements.txt
+#
+# Option 2: Use the setup script
 #   chmod +x setup.sh && ./setup.sh
 #
-# Option 2: Use the Python installer
+# Option 3: Use the Python installer
 #   python3 install.py
 #
-# Option 3: Use make
+# Option 4: Use make
 #   make setup
+#
+# ============================================================================
+# USAGE
+# ============================================================================
+#
+# Extract from auto-detected browser:
+#   python browser_forensics.py
+#
+# Extract from Firefox only:
+#   python browser_forensics.py --browser firefox
+#
+# Extract from Chrome:
+#   python browser_forensics.py --browser chrome
+#
+# Extract from specific profile path:
+#   python browser_forensics.py /path/to/profile
+#
+# List all detected browsers:
+#   python browser_forensics.py --list-browsers
 #
 # ============================================================================
 # NOTES
 # ============================================================================
 #
-# - No pip install required - all modules are built-in
-# - Zero Python dependencies = maximum portability and security
-# - Password decryption requires native Firefox (not Snap/Flatpak)
+# - Firefox password decryption requires native Firefox (not Snap/Flatpak)
+# - Chromium password decryption works on Windows, Linux, and macOS
+# - Browser must be closed during extraction to avoid database locks
 #
