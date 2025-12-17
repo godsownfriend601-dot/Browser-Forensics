@@ -563,7 +563,7 @@ def decrypt_chromium_passwords(
                 password = "[DECRYPTION FAILED]"
             
             # Convert timestamps
-            from chromium_queries import webkit_to_unix
+            from sql_queries import webkit_to_unix
             from datetime import datetime, timezone
             
             created_str = ""

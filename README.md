@@ -8,12 +8,11 @@ Extract and analyze forensic artifacts from web browsers - Firefox, Chrome, Edge
 ## 🚀 Quick Start
 
 ```bash
-# Clone and run
-git clone https://github.com/yourusername/browser-forensics.git
-cd browser-forensics
-pip install -r requirements.txt
+# Just run it! Dependencies auto-install on first run
 python main.py
 ```
+
+That's it! The tool automatically checks and installs required dependencies.
 
 ## ✨ Features
 
@@ -94,27 +93,27 @@ python main.py --check-env
 
 ```
 Browser-Key-Extraction/
-├── main.py              # Main entry point
+├── main.py              # Main entry point (auto-installs deps)
 ├── browser_profiles.py  # Browser detection & profiles
 ├── extractors.py        # Database extraction classes
 ├── sql_queries.py       # Firefox & Chromium SQL queries
 ├── nss_decrypt.py       # Firefox password decryption (NSS)
 ├── chromium_decrypt.py  # Chromium password decryption (DPAPI/AES)
 ├── utils.py             # Utility functions
-├── install.py           # Dependency installer
-├── requirements.txt     # Python dependencies
 └── README.md            # This file
 ```
 
-## 🔒 Password Decryption Requirements
+## 🔒 Password Decryption
 
-### Firefox
-- **Linux**: `libnss3` system library (native Firefox only, not Snap/Flatpak)
-- **Windows**: Firefox installed (uses bundled NSS DLLs)
+### Automatic Setup
+Dependencies (`pycryptodome`) are **automatically installed** when you run `main.py`.
 
-### Chromium Browsers
-- **Windows**: No additional dependencies (uses DPAPI)
-- **Linux/macOS**: `pycryptodome` package (`pip install pycryptodome`)
+### Firefox Requirements
+- **Linux**: `libnss3` system library (install: `sudo apt install libnss3` or `sudo pacman -S nss`)
+- **Windows**: Firefox must be installed (uses bundled NSS DLLs)
+
+### Chromium Requirements  
+- **All platforms**: Handled automatically by the tool
 
 ## 📊 Extracted Data
 

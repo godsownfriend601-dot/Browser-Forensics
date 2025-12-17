@@ -21,10 +21,55 @@ import csv
 import logging
 import os
 import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+
+# =============================================================================
+# Auto Dependency Checker - Runs on startup
+# =============================================================================
+
+def check_and_install_dependencies():
+    """Check and install required dependencies automatically."""
+    missing = []
+    
+    # Check pycryptodome (required for Chromium password decryption)
+    try:
+        from Crypto.Cipher import AES
+    except ImportError:
+        missing.append("pycryptodome")
+    
+    # Check secretstorage (optional for Linux GNOME keyring)
+    if sys.platform == "linux":
+        try:
+            import secretstorage
+        except ImportError:
+            pass  # Optional, don't add to missing
+    
+    if missing:
+        print(f"\033[93m[!] Missing dependencies: {', '.join(missing)}\033[0m")
+        print(f"\033[96m[*] Installing automatically...\033[0m")
+        
+        try:
+            for pkg in missing:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "--quiet", pkg],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            print(f"\033[92m[+] Dependencies installed successfully!\033[0m\n")
+        except subprocess.CalledProcessError:
+            print(f"\033[91m[!] Failed to install. Run: pip install {' '.join(missing)}\033[0m")
+            print(f"\033[93m[*] Continuing without Chromium password decryption...\033[0m\n")
+        except Exception as e:
+            print(f"\033[91m[!] Install error: {e}\033[0m\n")
+
+
+# Run dependency check on import
+check_and_install_dependencies()
 
 from browser_profiles import (
     BrowserProfile, BrowserType, BrowserFamily, BrowserInstallation,
