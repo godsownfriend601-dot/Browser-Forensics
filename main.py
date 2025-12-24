@@ -738,6 +738,13 @@ def extract_chromium(
                     all_data['passwords'] = credentials
                     decryption_success = True
                     print(f"  {colorize('✓', Colors.GREEN)} Passwords: {len(credentials)} decrypted")
+                    
+                    # Check for v20 encrypted passwords and show warning
+                    v20_count = sum(1 for c in credentials if '[v20 PROTECTED' in c.password)
+                    if v20_count > 0:
+                        print(f"  {colorize('⚠', Colors.YELLOW)} {v20_count} password(s) use Chrome 127+ App-Bound Encryption")
+                        print(f"  {colorize('  ', Colors.YELLOW)} Export from browser: Settings > Passwords > Export")
+                    
                     print_passwords_chromium(credentials)
                 elif errors:
                     print(f"  {colorize('✗', Colors.RED)} {errors[0] if errors else 'Unknown error'}")
