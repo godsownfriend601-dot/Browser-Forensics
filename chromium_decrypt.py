@@ -1,53 +1,44 @@
 #!/usr/bin/env python3
-"""Chromium Password Decryption Module.
+"""Chromium Password and Cookie Decryption Module (Windows Only).
 
-Decrypts saved passwords from Chromium-based browsers (Chrome, Edge, Brave, etc.).
+Decrypts saved passwords and cookies from Chromium-based browsers 
+(Chrome, Edge, Brave, etc.) on Windows.
 
-Encryption methods by platform:
-- Windows: DPAPI (Data Protection API) + AES-256-GCM (v10 format)
-- Linux: PBKDF2 + AES-128-CBC with system keyring or 'peanuts' key
-- macOS: PBKDF2 + AES-128-CBC with Keychain stored key
-
-Password format versions:
-- v10: AES-256-GCM with DPAPI-protected key (Windows)
-- v11: AES-256-GCM with Keychain key (macOS)  
-- v10/v11: AES-128-CBC with GNOME Keyring/libsecret (Linux)
+Encryption methods:
+- v10: AES-256-GCM with DPAPI-protected key (Chrome < 127)
+- v20: App-Bound Encryption with DPAPI + hardcoded keys (Chrome 127+)
 - Legacy: Direct DPAPI encryption (older Chrome)
 
+v20 Decryption (Chrome 127+):
+- Requires Administrator privileges
+- Uses LSASS impersonation for SYSTEM DPAPI context
+- Handles flag 1 (AES), flag 2 (ChaCha20), flag 3 (NCrypt+XOR)
+
 Requirements:
-- Windows: No additional dependencies (uses ctypes for DPAPI)
-- Linux: pycryptodome for AES (pip install pycryptodome)
-- Linux with GNOME: secretstorage for keyring access
+- Windows OS
+- pycryptodome (pip install pycryptodome)
+- PythonForWindows (pip install PythonForWindows) - for v20 admin decryption
 """
 
 import base64
+import io
 import json
 import os
 import sqlite3
 import shutil
+import struct
 import sys
 import tempfile
+import ctypes
+from ctypes import wintypes
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 
-# Platform-specific imports
-if sys.platform == "win32":
-    import ctypes
-    from ctypes import wintypes
-    import ctypes.wintypes
-
-# Browser-specific App-Bound Encryption (v20) IIDs for Windows
-BROWSER_ELEVATOR_IIDS = {
-    "chrome": "{708860E0-F641-4611-8895-7D867DD3675B}",
-    "chrome_beta": "{DD2646BA-3707-4BF8-B9A7-038691A68FC2}",
-    "chrome_canary": "{4C3CB658-3EC9-4E25-B114-C523E2339D92}",
-    "chrome_dev": "{AA67F288-48D1-461B-B16A-C5FD8A38EDE1}",
-    "edge": "{1FCBE96C-1697-43AF-9140-2897C7C69767}",
-    "brave": "{576B31AF-6369-4B6B-8560-E4B203A97A8B}",
-    "opera": "{68B95A67-C7CA-4926-964F-0459D8C4891A}",
-    "vivaldi": "{8B1D5A2F-2FDD-4E98-87FB-DEE7E69F2E19}",
-}
+# Windows-only check
+if sys.platform != "win32":
+    raise ImportError("This module only supports Windows")
 
 
 @dataclass
@@ -60,6 +51,19 @@ class DecryptedCredential:
     date_created: Optional[str] = None
     date_last_used: Optional[str] = None
     times_used: int = 0
+
+
+@dataclass
+class DecryptedCookie:
+    """Represents a decrypted browser cookie."""
+    host: str
+    name: str
+    value: str
+    path: str
+    expires: Optional[str] = None
+    created: Optional[str] = None
+    is_secure: bool = False
+    is_httponly: bool = False
 
 
 class ChromiumDecryptionError(Exception):
@@ -77,13 +81,18 @@ class DecryptionFailed(ChromiumDecryptionError):
     pass
 
 
-class UnsupportedPlatform(ChromiumDecryptionError):
-    """Platform is not supported for decryption."""
+class DependencyMissing(ChromiumDecryptionError):
+    """Required dependency is not installed."""
     pass
 
 
-class DependencyMissing(ChromiumDecryptionError):
-    """Required dependency is not installed."""
+class V20EncryptionError(DecryptionFailed):
+    """v20 App-Bound Encryption requires admin privileges."""
+    pass
+
+
+class AdminRequired(ChromiumDecryptionError):
+    """Operation requires administrator privileges."""
     pass
 
 
@@ -91,111 +100,296 @@ class DependencyMissing(ChromiumDecryptionError):
 # Windows DPAPI Functions
 # =============================================================================
 
-if sys.platform == "win32":
-    
-    class DATA_BLOB(ctypes.Structure):
-        """Windows DATA_BLOB structure for DPAPI."""
-        _fields_ = [
-            ("cbData", wintypes.DWORD),
-            ("pbData", ctypes.POINTER(ctypes.c_char)),
-        ]
-    
-    def _win_dpapi_decrypt(encrypted_data: bytes) -> bytes:
-        """Decrypt data using Windows DPAPI.
-        
-        Args:
-            encrypted_data: DPAPI-encrypted bytes
-        
-        Returns:
-            Decrypted bytes
-        
-        Raises:
-            DecryptionFailed: If DPAPI decryption fails
-        """
-        crypt32 = ctypes.windll.crypt32
-        kernel32 = ctypes.windll.kernel32
-        
-        # Input blob
-        input_blob = DATA_BLOB()
-        input_blob.cbData = len(encrypted_data)
-        input_blob.pbData = ctypes.cast(
-            ctypes.create_string_buffer(encrypted_data, len(encrypted_data)),
-            ctypes.POINTER(ctypes.c_char)
-        )
-        
-        # Output blob
-        output_blob = DATA_BLOB()
-        
-        # Call CryptUnprotectData
-        result = crypt32.CryptUnprotectData(
-            ctypes.byref(input_blob),
-            None,  # description
-            None,  # optional entropy
-            None,  # reserved
-            None,  # prompt struct
-            0,     # flags
-            ctypes.byref(output_blob)
-        )
-        
-        if not result:
-            raise DecryptionFailed(f"DPAPI decryption failed: {ctypes.GetLastError()}")
-        
-        # Extract decrypted data
-        decrypted = ctypes.string_at(output_blob.pbData, output_blob.cbData)
-        
-        # Free the output buffer
-        kernel32.LocalFree(output_blob.pbData)
-        
-        return decrypted
+class DATA_BLOB(ctypes.Structure):
+    """Windows DATA_BLOB structure for DPAPI."""
+    _fields_ = [
+        ("cbData", wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_char)),
+    ]
 
-    def _win_get_app_bound_key(browser_name: str, user_data_dir: Path) -> Optional[bytes]:
-        """Get the App-Bound Encryption key for v20 passwords on Windows.
+
+def _win_dpapi_decrypt(encrypted_data: bytes) -> bytes:
+    """Decrypt data using Windows DPAPI.
+    
+    Args:
+        encrypted_data: DPAPI-encrypted bytes
+    
+    Returns:
+        Decrypted bytes
+    
+    Raises:
+        DecryptionFailed: If DPAPI decryption fails
+    """
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    
+    input_blob = DATA_BLOB()
+    input_blob.cbData = len(encrypted_data)
+    input_blob.pbData = ctypes.cast(
+        ctypes.create_string_buffer(encrypted_data, len(encrypted_data)),
+        ctypes.POINTER(ctypes.c_char)
+    )
+    
+    output_blob = DATA_BLOB()
+    
+    result = crypt32.CryptUnprotectData(
+        ctypes.byref(input_blob),
+        None, None, None, None, 0,
+        ctypes.byref(output_blob)
+    )
+    
+    if not result:
+        raise DecryptionFailed(f"DPAPI decryption failed: {ctypes.GetLastError()}")
+    
+    decrypted = ctypes.string_at(output_blob.pbData, output_blob.cbData)
+    kernel32.LocalFree(output_blob.pbData)
+    
+    return decrypted
+
+
+# =============================================================================
+# Admin/Privilege Functions
+# =============================================================================
+
+def is_admin() -> bool:
+    """Check if running with administrator privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except:
+        return False
+
+
+def request_admin_elevation() -> bool:
+    """Request UAC elevation by relaunching script as admin.
+    
+    Returns:
+        True if elevation was requested (script will exit), False if already admin
+    """
+    if is_admin():
+        return False
+    
+    script = sys.argv[0]
+    params = ' '.join([f'"{arg}"' for arg in sys.argv[1:]])
+    
+    try:
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, f'"{script}" {params}', None, 1
+        )
+        return True
+    except:
+        return False
+
+
+# =============================================================================
+# v20 Admin Decryption (LSASS Impersonation)
+# =============================================================================
+
+# Cached v20 key per browser
+_v20_key_cache: Dict[str, bytes] = {}
+
+
+def _check_v20_dependencies() -> bool:
+    """Check if v20 admin decryption dependencies are available."""
+    try:
+        import windows
+        import windows.crypto
+        from Crypto.Cipher import AES, ChaCha20_Poly1305
+        return True
+    except ImportError:
+        return False
+
+
+@contextmanager
+def _impersonate_lsass():
+    """Impersonate lsass.exe to get SYSTEM privilege for DPAPI."""
+    import windows
+    import windows.generated_def as gdef
+    
+    original_token = windows.current_thread.token
+    try:
+        windows.current_process.token.enable_privilege("SeDebugPrivilege")
+        proc = next(p for p in windows.system.processes if p.name == "lsass.exe")
+        lsass_token = proc.token
+        impersonation_token = lsass_token.duplicate(
+            type=gdef.TokenImpersonation,
+            impersonation_level=gdef.SecurityImpersonation
+        )
+        windows.current_thread.token = impersonation_token
+        yield
+    finally:
+        windows.current_thread.token = original_token
+
+
+def _parse_key_blob(blob_data: bytes) -> dict:
+    """Parse the decrypted v20 key blob structure."""
+    buffer = io.BytesIO(blob_data)
+    parsed_data = {}
+
+    header_len = struct.unpack('<I', buffer.read(4))[0]
+    parsed_data['header'] = buffer.read(header_len)
+    content_len = struct.unpack('<I', buffer.read(4))[0]
+    
+    parsed_data['flag'] = buffer.read(1)[0]
+    
+    if parsed_data['flag'] in (1, 2):
+        parsed_data['iv'] = buffer.read(12)
+        parsed_data['ciphertext'] = buffer.read(32)
+        parsed_data['tag'] = buffer.read(16)
+    elif parsed_data['flag'] == 3:
+        parsed_data['encrypted_aes_key'] = buffer.read(32)
+        parsed_data['iv'] = buffer.read(12)
+        parsed_data['ciphertext'] = buffer.read(32)
+        parsed_data['tag'] = buffer.read(16)
+    else:
+        raise ValueError(f"Unsupported v20 flag: {parsed_data['flag']}")
+
+    return parsed_data
+
+
+def _decrypt_with_cng(input_data: bytes, key_name: str = "Google Chromekey1") -> bytes:
+    """Decrypt data using Windows CNG NCrypt API."""
+    import windows.generated_def as gdef
+    
+    ncrypt = ctypes.windll.NCRYPT
+    hProvider = gdef.NCRYPT_PROV_HANDLE()
+    
+    status = ncrypt.NCryptOpenStorageProvider(
+        ctypes.byref(hProvider), 
+        "Microsoft Software Key Storage Provider", 0
+    )
+    if status != 0:
+        raise DecryptionFailed(f"NCryptOpenStorageProvider failed: {status}")
+
+    hKey = gdef.NCRYPT_KEY_HANDLE()
+    status = ncrypt.NCryptOpenKey(hProvider, ctypes.byref(hKey), key_name, 0, 0)
+    if status != 0:
+        ncrypt.NCryptFreeObject(hProvider)
+        raise DecryptionFailed(f"NCryptOpenKey failed: {status}")
+
+    pcbResult = gdef.DWORD(0)
+    input_buffer = (ctypes.c_ubyte * len(input_data)).from_buffer_copy(input_data)
+
+    status = ncrypt.NCryptDecrypt(
+        hKey, input_buffer, len(input_buffer), None,
+        None, 0, ctypes.byref(pcbResult), 0x40
+    )
+    if status != 0:
+        ncrypt.NCryptFreeObject(hKey)
+        ncrypt.NCryptFreeObject(hProvider)
+        raise DecryptionFailed(f"NCryptDecrypt size query failed: {status}")
+
+    output_buffer = (ctypes.c_ubyte * pcbResult.value)()
+    status = ncrypt.NCryptDecrypt(
+        hKey, input_buffer, len(input_buffer), None,
+        output_buffer, pcbResult.value, ctypes.byref(pcbResult), 0x40
+    )
+    
+    ncrypt.NCryptFreeObject(hKey)
+    ncrypt.NCryptFreeObject(hProvider)
+    
+    if status != 0:
+        raise DecryptionFailed(f"NCryptDecrypt failed: {status}")
+
+    return bytes(output_buffer[:pcbResult.value])
+
+
+def _derive_v20_master_key(parsed_data: dict, browser_name: str = "chrome") -> bytes:
+    """Derive the v20 master key based on flag type."""
+    from Crypto.Cipher import AES, ChaCha20_Poly1305
+    
+    # Browser-specific CNG key names
+    cng_key_names = {
+        "chrome": "Google Chromekey1",
+        "edge": "Microsoft Edgekey1",
+        "brave": "Brave Softwarekey1",
+    }
+    
+    if parsed_data['flag'] == 1:
+        # AES-GCM with hardcoded key
+        aes_key = bytes.fromhex("B31C6E241AC846728DA9C1FAC4936651CFFB944D143AB816276BCC6DA0284787")
+        cipher = AES.new(aes_key, AES.MODE_GCM, nonce=parsed_data['iv'])
+        return cipher.decrypt_and_verify(parsed_data['ciphertext'], parsed_data['tag'])
         
-        Chrome 127+ uses Application-Bound Encryption (ABE) which stores an 
-        additional encrypted key in Local State under os_crypt.app_bound_encrypted_key.
-        This key is decrypted using DPAPI with additional system-level protection.
+    elif parsed_data['flag'] == 2:
+        # ChaCha20-Poly1305 with hardcoded key
+        chacha_key = bytes.fromhex("E98F37D7F4E1FA433D19304DC2258042090E2D1D7EEA7670D41F738D08729660")
+        cipher = ChaCha20_Poly1305.new(key=chacha_key, nonce=parsed_data['iv'])
+        return cipher.decrypt_and_verify(parsed_data['ciphertext'], parsed_data['tag'])
         
-        Args:
-            browser_name: Name of the browser (chrome, edge, brave, etc.)
-            user_data_dir: Path to browser's User Data directory
+    elif parsed_data['flag'] == 3:
+        # NCrypt + XOR + AES-GCM
+        xor_key = bytes.fromhex("CCF8A1CEC56605B8517552BA1A2D061C03A29E90274FB2FCF59BA4B75C392390")
+        key_name = cng_key_names.get(browser_name.lower(), "Google Chromekey1")
         
-        Returns:
-            32-byte AES key for v20 decryption, or None if not available
-        """
-        local_state_path = user_data_dir / "Local State"
-        if not local_state_path.exists():
+        with _impersonate_lsass():
+            decrypted_aes_key = _decrypt_with_cng(parsed_data['encrypted_aes_key'], key_name)
+        
+        xored_key = bytes([a ^ b for a, b in zip(decrypted_aes_key, xor_key)])
+        cipher = AES.new(xored_key, AES.MODE_GCM, nonce=parsed_data['iv'])
+        return cipher.decrypt_and_verify(parsed_data['ciphertext'], parsed_data['tag'])
+    
+    raise DecryptionFailed(f"Unknown v20 flag: {parsed_data['flag']}")
+
+
+def get_v20_key_admin(user_data_dir: Path, browser_name: str = "chrome") -> Optional[bytes]:
+    """Get v20 App-Bound Encryption key using admin privileges.
+    
+    Requires:
+    - Administrator privileges
+    - PythonForWindows library
+    
+    Args:
+        user_data_dir: Path to browser's User Data directory
+        browser_name: Browser name (chrome, edge, brave)
+    
+    Returns:
+        32-byte AES key, or None if extraction fails
+    """
+    import windows
+    import windows.crypto
+    
+    # Check cache first
+    cache_key = f"{user_data_dir}:{browser_name}"
+    if cache_key in _v20_key_cache:
+        return _v20_key_cache[cache_key]
+    
+    local_state_path = user_data_dir / "Local State"
+    if not local_state_path.exists():
+        return None
+    
+    try:
+        with open(local_state_path, "r", encoding="utf-8") as f:
+            local_state = json.load(f)
+        
+        app_bound_key_b64 = local_state.get("os_crypt", {}).get("app_bound_encrypted_key")
+        if not app_bound_key_b64:
             return None
         
-        try:
-            with open(local_state_path, "r", encoding="utf-8") as f:
-                local_state = json.load(f)
-            
-            # Try to get app_bound_encrypted_key
-            app_bound_key_b64 = local_state.get("os_crypt", {}).get("app_bound_encrypted_key")
-            if not app_bound_key_b64:
-                return None
-            
-            app_bound_key = base64.b64decode(app_bound_key_b64)
-            
-            # The app_bound_encrypted_key has format: "APPB" + DPAPI encrypted data
-            if app_bound_key[:4] != b"APPB":
-                return None
-            
-            # Decrypt the outer DPAPI layer
-            try:
-                decrypted_key = _win_dpapi_decrypt(app_bound_key[4:])
-            except DecryptionFailed:
-                return None
-            
-            # The decrypted data contains the actual AES key
-            # Format varies but typically the last 32 bytes are the key
-            if len(decrypted_key) >= 32:
-                return decrypted_key[-32:]
-            
+        key_blob_encrypted = base64.b64decode(app_bound_key_b64)
+        if key_blob_encrypted[:4] != b"APPB":
             return None
-            
-        except (json.JSONDecodeError, IOError, KeyError):
-            return None
+        
+        key_blob_encrypted = key_blob_encrypted[4:]
+        
+        # Step 1: Decrypt with SYSTEM DPAPI (via LSASS impersonation)
+        with _impersonate_lsass():
+            key_blob_system = windows.crypto.dpapi.unprotect(key_blob_encrypted)
+        
+        # Step 2: Decrypt with User DPAPI
+        key_blob_user = windows.crypto.dpapi.unprotect(key_blob_system)
+        
+        # Step 3: Parse and derive the master key
+        parsed_data = _parse_key_blob(key_blob_user)
+        master_key = _derive_v20_master_key(parsed_data, browser_name)
+        
+        # Cache the key
+        _v20_key_cache[cache_key] = master_key
+        
+        return master_key
+        
+    except Exception as e:
+        # Don't cache failures
+        return None
 
 
 
@@ -231,45 +425,12 @@ def _aes_gcm_decrypt(encrypted_data: bytes, key: bytes) -> bytes:
     return cipher.decrypt_and_verify(ciphertext, tag)
 
 
-def _aes_cbc_decrypt(encrypted_data: bytes, key: bytes, iv: bytes = None) -> bytes:
-    """Decrypt AES-128-CBC encrypted data (Linux).
-    
-    Args:
-        encrypted_data: Encrypted bytes
-        key: 16-byte AES key
-        iv: Initialization vector (default: 16 bytes of space)
-    
-    Returns:
-        Decrypted bytes (PKCS7 padding removed)
-    """
-    try:
-        from Crypto.Cipher import AES
-    except ImportError:
-        raise DependencyMissing(
-            "pycryptodome is required for AES decryption. "
-            "Install with: pip install pycryptodome"
-        )
-    
-    if iv is None:
-        iv = b" " * 16  # Chromium uses spaces as IV on Linux
-    
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    decrypted = cipher.decrypt(encrypted_data)
-    
-    # Remove PKCS7 padding
-    padding_len = decrypted[-1]
-    if padding_len < 16:
-        decrypted = decrypted[:-padding_len]
-    
-    return decrypted
-
-
 # =============================================================================
 # Key Extraction Functions
 # =============================================================================
 
 def get_encryption_key_windows(user_data_dir: Path) -> bytes:
-    """Extract and decrypt the AES key on Windows.
+    """Extract and decrypt the v10 AES key on Windows.
     
     The key is stored in Local State, encrypted with DPAPI.
     Format: "DPAPI" prefix (5 bytes) + DPAPI blob
@@ -304,14 +465,14 @@ def get_encryption_key_windows(user_data_dir: Path) -> bytes:
 
 
 def get_app_bound_key_windows(user_data_dir: Path, browser_name: str = "chrome") -> Optional[bytes]:
-    """Extract the App-Bound Encryption key for v20 passwords on Windows.
+    """Get v20 App-Bound Encryption key.
     
-    Chrome 127+ introduced Application-Bound Encryption (ABE) which uses
-    a separate key stored in os_crypt.app_bound_encrypted_key.
+    If running as admin with PythonForWindows, uses LSASS impersonation.
+    Otherwise returns None (v20 data will show as protected).
     
     Args:
         user_data_dir: Path to browser's User Data directory
-        browser_name: Browser name for IID lookup
+        browser_name: Browser name (chrome, edge, brave)
     
     Returns:
         32-byte AES key for v20 decryption, or None if not available
@@ -320,161 +481,40 @@ def get_app_bound_key_windows(user_data_dir: Path, browser_name: str = "chrome")
     if not local_state_path.exists():
         return None
     
+    # Check if there's a v20 key
     try:
         with open(local_state_path, "r", encoding="utf-8") as f:
             local_state = json.load(f)
         
-        # Get app_bound_encrypted_key
         app_bound_key_b64 = local_state.get("os_crypt", {}).get("app_bound_encrypted_key")
         if not app_bound_key_b64:
-            return None
-        
-        app_bound_key = base64.b64decode(app_bound_key_b64)
-        
-        # The key has format: "APPB" (4 bytes) + encrypted data
-        if len(app_bound_key) < 4 or app_bound_key[:4] != b"APPB":
-            return None
-        
-        # Decrypt using DPAPI
-        try:
-            decrypted = _win_dpapi_decrypt(app_bound_key[4:])
-            # The decrypted data should be 32 bytes (the AES-256 key)
-            if len(decrypted) >= 32:
-                return decrypted[-32:]
-            return decrypted
-        except DecryptionFailed:
-            # ABE key may require elevation or specific app context
-            return None
+            return None  # No v20 key present
             
     except (json.JSONDecodeError, IOError, KeyError):
         return None
-
-
-def get_encryption_key_linux(user_data_dir: Path) -> bytes:
-    """Extract the AES key on Linux.
     
-    Linux Chrome uses PBKDF2 to derive a key from:
-    - GNOME Keyring stored password (if available)
-    - Or the hardcoded password "peanuts"
+    # If admin and dependencies available, use admin method
+    if is_admin() and _check_v20_dependencies():
+        try:
+            return get_v20_key_admin(user_data_dir, browser_name)
+        except Exception:
+            pass
     
-    Args:
-        user_data_dir: Path to browser's user data directory
-    
-    Returns:
-        16-byte AES decryption key
-    """
+    # Fallback: try standard DPAPI (usually fails for v20)
     try:
-        from Crypto.Protocol.KDF import PBKDF2
-        from Crypto.Hash import SHA1
-    except ImportError:
-        raise DependencyMissing(
-            "pycryptodome is required. Install with: pip install pycryptodome"
-        )
-    
-    # Try to get password from GNOME Keyring
-    password = None
-    
-    try:
-        import secretstorage
-        bus = secretstorage.dbus_init()
-        collection = secretstorage.get_default_collection(bus)
-        
-        # Search for Chrome/Chromium password
-        for item in collection.get_all_items():
-            label = item.get_label().lower()
-            if "chrome" in label or "chromium" in label:
-                password = item.get_secret()
-                break
-        bus.close()
-    except Exception:
-        # secretstorage not available or keyring locked
+        app_bound_key = base64.b64decode(app_bound_key_b64)
+        if app_bound_key[:4] == b"APPB":
+            decrypted = _win_dpapi_decrypt(app_bound_key[4:])
+            if len(decrypted) >= 32:
+                return decrypted[-32:]
+    except:
         pass
     
-    # Fall back to hardcoded password
-    if password is None:
-        password = b"peanuts"
-    elif isinstance(password, str):
-        password = password.encode("utf-8")
-    
-    # Derive key using PBKDF2
-    # Chrome uses 1 iteration with SHA1
-    key = PBKDF2(
-        password,
-        b"saltysalt",  # Fixed salt used by Chrome
-        dkLen=16,
-        count=1,
-        hmac_hash_module=SHA1
-    )
-    
-    return key
-
-
-def get_encryption_key_macos(user_data_dir: Path) -> bytes:
-    """Extract the AES key on macOS.
-    
-    macOS Chrome stores the key in Keychain.
-    
-    Args:
-        user_data_dir: Path to browser's user data directory
-    
-    Returns:
-        16-byte AES decryption key
-    """
-    try:
-        from Crypto.Protocol.KDF import PBKDF2
-        from Crypto.Hash import SHA1
-    except ImportError:
-        raise DependencyMissing(
-            "pycryptodome is required. Install with: pip install pycryptodome"
-        )
-    
-    # Try to get password from Keychain using security command
-    import subprocess
-    
-    # Different browsers use different service names
-    service_names = [
-        "Chrome Safe Storage",
-        "Chromium Safe Storage", 
-        "Microsoft Edge Safe Storage",
-        "Brave Safe Storage",
-        "Opera Safe Storage",
-        "Vivaldi Safe Storage",
-    ]
-    
-    password = None
-    for service in service_names:
-        try:
-            result = subprocess.run(
-                ["security", "find-generic-password", "-s", service, "-w"],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0:
-                password = result.stdout.strip().encode("utf-8")
-                break
-        except Exception:
-            continue
-    
-    if password is None:
-        raise EncryptionKeyNotFound(
-            "Could not retrieve password from macOS Keychain. "
-            "You may need to unlock Keychain or grant access."
-        )
-    
-    # Derive key using PBKDF2
-    key = PBKDF2(
-        password,
-        b"saltysalt",
-        dkLen=16,
-        count=1003,  # macOS uses 1003 iterations
-        hmac_hash_module=SHA1
-    )
-    
-    return key
+    return None
 
 
 def get_encryption_key(user_data_dir: Path) -> bytes:
-    """Get the encryption key for the current platform.
+    """Get the v10 encryption key (Windows).
     
     Args:
         user_data_dir: Path to browser's User Data directory
@@ -482,22 +522,63 @@ def get_encryption_key(user_data_dir: Path) -> bytes:
     Returns:
         AES decryption key
     """
-    if sys.platform == "win32":
-        return get_encryption_key_windows(user_data_dir)
-    elif sys.platform == "darwin":
-        return get_encryption_key_macos(user_data_dir)
-    else:  # Linux and others
-        return get_encryption_key_linux(user_data_dir)
+    return get_encryption_key_windows(user_data_dir)
+
+
+# =============================================================================
+# Check for v20 Encrypted Data
+# =============================================================================
+
+def has_v20_encrypted_data(profile_path: Path) -> Tuple[bool, int, int]:
+    """Check if profile has v20 encrypted passwords or cookies.
+    
+    Returns:
+        Tuple of (has_v20, password_count, cookie_count)
+    """
+    v20_passwords = 0
+    v20_cookies = 0
+    
+    # Check passwords
+    login_db = profile_path / "Login Data"
+    if login_db.exists():
+        try:
+            temp_db = Path(tempfile.mkdtemp()) / "Login Data"
+            shutil.copy2(login_db, temp_db)
+            conn = sqlite3.connect(f"file:{temp_db}?mode=ro", uri=True)
+            cursor = conn.cursor()
+            cursor.execute("SELECT password_value FROM logins")
+            for row in cursor.fetchall():
+                if row[0] and row[0][:3] == b"v20":
+                    v20_passwords += 1
+            conn.close()
+            shutil.rmtree(temp_db.parent, ignore_errors=True)
+        except:
+            pass
+    
+    # Check cookies
+    for cookie_path in [profile_path / "Cookies", profile_path / "Network" / "Cookies"]:
+        if cookie_path.exists():
+            try:
+                temp_db = Path(tempfile.mkdtemp()) / "Cookies"
+                shutil.copy2(cookie_path, temp_db)
+                conn = sqlite3.connect(f"file:{temp_db}?mode=ro", uri=True)
+                cursor = conn.cursor()
+                cursor.execute("SELECT encrypted_value FROM cookies")
+                for row in cursor.fetchall():
+                    if row[0] and row[0][:3] == b"v20":
+                        v20_cookies += 1
+                conn.close()
+                shutil.rmtree(temp_db.parent, ignore_errors=True)
+            except:
+                pass
+            break
+    
+    return (v20_passwords > 0 or v20_cookies > 0), v20_passwords, v20_cookies
 
 
 # =============================================================================
 # Password Decryption Functions
 # =============================================================================
-
-class V20EncryptionError(DecryptionFailed):
-    """Special exception for v20 App-Bound Encryption that cannot be decrypted."""
-    pass
-
 
 def decrypt_password_windows(encrypted_password: bytes, key: bytes, app_bound_key: bytes = None) -> str:
     """Decrypt a Chromium password on Windows.
@@ -507,39 +588,29 @@ def decrypt_password_windows(encrypted_password: bytes, key: bytes, app_bound_ke
     Args:
         encrypted_password: Encrypted password bytes
         key: AES decryption key (v10)
-        app_bound_key: App-Bound Encryption key for v20 (optional)
+        app_bound_key: App-Bound Encryption key for v20 (if available)
     
     Returns:
         Decrypted password string
         
     Raises:
-        V20EncryptionError: If v20 encryption is used (Chrome 127+)
+        V20EncryptionError: If v20 encryption is used and no key available
         DecryptionFailed: For other decryption failures
     """
     if not encrypted_password:
         return ""
     
-    # v20 format: "v20" + nonce (12 bytes) + ciphertext + tag (16 bytes)
-    # Application-Bound Encryption (Chrome 127+ / July 2024)
-    # This encryption binds the key to the browser's code-signing certificate
-    # and cannot be decrypted outside the browser's process context.
+    # v20 format: Chrome 127+ App-Bound Encryption
     if encrypted_password[:3] == b"v20":
         if app_bound_key:
             try:
                 return _aes_gcm_decrypt(encrypted_password[3:], app_bound_key).decode("utf-8")
-            except Exception:
-                pass
+            except Exception as e:
+                raise DecryptionFailed(f"v20 decryption failed: {e}")
         
-        # Try with regular v10 key as fallback (won't work but try anyway)
-        try:
-            return _aes_gcm_decrypt(encrypted_password[3:], key).decode("utf-8")
-        except Exception:
-            raise V20EncryptionError(
-                "v20 App-Bound Encryption (Chrome 127+) - "
-                "Use browser's Settings > Passwords > Export"
-            )
+        raise V20EncryptionError("v20 encryption - run as Administrator to decrypt")
     
-    # v10 format: "v10" + nonce + ciphertext + tag
+    # v10 format: AES-256-GCM with DPAPI key
     if encrypted_password[:3] == b"v10":
         try:
             return _aes_gcm_decrypt(encrypted_password[3:], key).decode("utf-8")
@@ -553,72 +624,219 @@ def decrypt_password_windows(encrypted_password: bytes, key: bytes, app_bound_ke
         raise DecryptionFailed(f"DPAPI decryption failed: {e}")
 
 
-def decrypt_password_linux(encrypted_password: bytes, key: bytes) -> str:
-    """Decrypt a Chromium password on Linux.
-    
-    Format: "v10" or "v11" prefix + encrypted data
-    
-    Args:
-        encrypted_password: Encrypted password bytes
-        key: AES decryption key (16 bytes)
-    
-    Returns:
-        Decrypted password string
-    """
-    if not encrypted_password:
-        return ""
-    
-    # v10/v11 format
-    if encrypted_password[:3] in (b"v10", b"v11"):
-        try:
-            return _aes_cbc_decrypt(encrypted_password[3:], key).decode("utf-8")
-        except Exception as e:
-            raise DecryptionFailed(f"AES-CBC decryption failed: {e}")
-    
-    # Unencrypted (very old Chrome)
-    return encrypted_password.decode("utf-8", errors="ignore")
-
-
-def decrypt_password_macos(encrypted_password: bytes, key: bytes) -> str:
-    """Decrypt a Chromium password on macOS.
-    
-    Args:
-        encrypted_password: Encrypted password bytes
-        key: AES decryption key (16 bytes)
-    
-    Returns:
-        Decrypted password string
-    """
-    if not encrypted_password:
-        return ""
-    
-    # v10 format
-    if encrypted_password[:3] == b"v10":
-        try:
-            return _aes_cbc_decrypt(encrypted_password[3:], key).decode("utf-8")
-        except Exception as e:
-            raise DecryptionFailed(f"AES-CBC decryption failed: {e}")
-    
-    return encrypted_password.decode("utf-8", errors="ignore")
-
-
 def decrypt_password(encrypted_password: bytes, key: bytes, app_bound_key: bytes = None) -> str:
-    """Decrypt a password using the appropriate method for this platform.
+    """Decrypt a password (Windows only).
     
     Args:
         encrypted_password: Encrypted password bytes from database
         key: Decryption key
-        app_bound_key: App-Bound Encryption key for v20 (Windows only)
+        app_bound_key: App-Bound Encryption key for v20
     
     Returns:
         Decrypted password string
     """
-    if sys.platform == "win32":
-        return decrypt_password_windows(encrypted_password, key, app_bound_key)
-    elif sys.platform == "darwin":
-        return decrypt_password_macos(encrypted_password, key)
-    else:
-        return decrypt_password_linux(encrypted_password, key)
+    return decrypt_password_windows(encrypted_password, key, app_bound_key)
+
+
+# =============================================================================
+# Cookie Decryption Functions
+# =============================================================================
+
+def decrypt_cookie_windows(encrypted_value: bytes, key: bytes, app_bound_key: bytes = None) -> str:
+    """Decrypt a Chromium cookie value on Windows.
+    
+    Handles v10 (AES-GCM), v20 (App-Bound Encryption), and legacy (DPAPI) formats.
+    Note: v20 cookies have a 32-byte metadata header after decryption.
+    
+    Args:
+        encrypted_value: Encrypted cookie value bytes
+        key: AES decryption key (v10)
+        app_bound_key: App-Bound Encryption key for v20
+    
+    Returns:
+        Decrypted cookie value string
+    """
+    if not encrypted_value:
+        return ""
+    
+    # v20 format: Chrome 127+ App-Bound Encryption
+    if encrypted_value[:3] == b"v20":
+        if app_bound_key:
+            try:
+                # v20 cookies have 32-byte metadata header
+                decrypted = _aes_gcm_decrypt(encrypted_value[3:], app_bound_key)
+                if len(decrypted) > 32:
+                    decrypted = decrypted[32:]  # Strip cookie metadata
+                return decrypted.decode("utf-8")
+            except Exception as e:
+                raise DecryptionFailed(f"v20 cookie decryption failed: {e}")
+        
+        raise V20EncryptionError("v20 cookie - run as Administrator to decrypt")
+    
+    # v10 format: AES-256-GCM
+    if encrypted_value[:3] == b"v10":
+        try:
+            return _aes_gcm_decrypt(encrypted_value[3:], key).decode("utf-8")
+        except Exception as e:
+            raise DecryptionFailed(f"AES-GCM cookie decryption failed: {e}")
+    
+    # Legacy format: Direct DPAPI
+    try:
+        return _win_dpapi_decrypt(encrypted_value).decode("utf-8")
+    except Exception as e:
+        raise DecryptionFailed(f"DPAPI cookie decryption failed: {e}")
+
+
+def decrypt_cookie(encrypted_value: bytes, key: bytes, app_bound_key: bytes = None) -> str:
+    """Decrypt a cookie value (Windows only).
+    
+    Args:
+        encrypted_value: Encrypted cookie value bytes from database
+        key: Decryption key (v10)
+        app_bound_key: App-Bound Encryption key for v20
+    
+    Returns:
+        Decrypted cookie value string
+    """
+    return decrypt_cookie_windows(encrypted_value, key, app_bound_key)
+
+
+def decrypt_chromium_cookies(
+    profile_path: Path,
+    user_data_dir: Path,
+    browser_name: str = "chrome"
+) -> Tuple[List[DecryptedCookie], List[str]]:
+    """Decrypt all cookies from a Chromium profile.
+    
+    Args:
+        profile_path: Path to browser profile directory
+        user_data_dir: Path to User Data directory (contains Local State)
+        browser_name: Browser name (chrome, edge, brave) for v20 key
+    
+    Returns:
+        Tuple of (list of DecryptedCookie, list of error messages)
+    """
+    cookies: List[DecryptedCookie] = []
+    errors: List[str] = []
+    
+    # Look for cookies in both standard and Network locations
+    cookie_paths = [
+        profile_path / "Cookies",
+        profile_path / "Network" / "Cookies",
+    ]
+    
+    cookies_db = None
+    for path in cookie_paths:
+        if path.exists():
+            cookies_db = path
+            break
+    
+    if not cookies_db:
+        errors.append(f"Cookies database not found in: {profile_path}")
+        return cookies, errors
+    
+    # Get decryption key
+    try:
+        key = get_encryption_key(user_data_dir)
+    except (EncryptionKeyNotFound, DependencyMissing) as e:
+        errors.append(str(e))
+        return cookies, errors
+    
+    # Get v20 key (if admin and dependencies available)
+    app_bound_key = get_app_bound_key_windows(user_data_dir, browser_name)
+    
+    # Copy database to temp location
+    temp_dir = Path(tempfile.mkdtemp(prefix="chromium_cookies_"))
+    temp_db = temp_dir / "Cookies"
+    
+    try:
+        shutil.copy2(cookies_db, temp_db)
+        
+        # Copy WAL files
+        for suffix in ["-wal", "-shm", "-journal"]:
+            wal_path = cookies_db.parent / f"Cookies{suffix}"
+            if wal_path.exists():
+                shutil.copy2(wal_path, temp_dir / f"Cookies{suffix}")
+        
+        conn = sqlite3.connect(f"file:{temp_db}?mode=ro", uri=True)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT host_key, name, encrypted_value, path,
+                   creation_utc, expires_utc, is_secure, is_httponly
+            FROM cookies
+        """)
+        
+        v20_count = 0
+        
+        for row in cursor.fetchall():
+            host_key = row[0] or ""
+            name = row[1] or ""
+            encrypted_value = row[2]
+            path = row[3] or "/"
+            creation_utc = row[4]
+            expires_utc = row[5]
+            is_secure = bool(row[6])
+            is_httponly = bool(row[7])
+            
+            # Decrypt cookie value
+            try:
+                value = decrypt_cookie(encrypted_value, key, app_bound_key) if encrypted_value else ""
+            except V20EncryptionError:
+                v20_count += 1
+                value = "[v20 PROTECTED]"
+            except DecryptionFailed as e:
+                errors.append(f"Cookie {name}@{host_key}: {e}")
+                value = "[DECRYPTION FAILED]"
+            
+            # Convert timestamps
+            from sql_queries import webkit_to_unix
+            from datetime import datetime, timezone
+            
+            created_str = ""
+            if creation_utc:
+                try:
+                    unix_ts = webkit_to_unix(creation_utc)
+                    if unix_ts > 0:
+                        created_str = datetime.fromtimestamp(unix_ts, tz=timezone.utc).isoformat()
+                except (ValueError, OSError):
+                    pass
+            
+            expires_str = ""
+            if expires_utc and expires_utc > 0:
+                try:
+                    unix_ts = webkit_to_unix(expires_utc)
+                    if unix_ts > 0:
+                        expires_str = datetime.fromtimestamp(unix_ts, tz=timezone.utc).isoformat()
+                except (ValueError, OSError):
+                    pass
+            
+            cookies.append(DecryptedCookie(
+                host=host_key,
+                name=name,
+                value=value,
+                path=path,
+                expires=expires_str,
+                created=created_str,
+                is_secure=is_secure,
+                is_httponly=is_httponly
+            ))
+        
+        conn.close()
+        
+        if v20_count > 0 and not is_admin():
+            errors.insert(0,
+                f"{v20_count} cookie(s) use v20 encryption. Run as Administrator to decrypt."
+            )
+        
+    except sqlite3.Error as e:
+        errors.append(f"Database error: {e}")
+    except Exception as e:
+        errors.append(f"Unexpected error: {e}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    return cookies, errors
 
 
 # =============================================================================
@@ -657,10 +875,8 @@ def decrypt_chromium_passwords(
         errors.append(str(e))
         return credentials, errors
     
-    # Try to get App-Bound Encryption key for v20 passwords (Windows only)
-    app_bound_key = None
-    if sys.platform == "win32":
-        app_bound_key = get_app_bound_key_windows(user_data_dir, browser_name)
+    # Get App-Bound Encryption key for v20 passwords (if admin)
+    app_bound_key = get_app_bound_key_windows(user_data_dir, browser_name)
     
     # Copy database to temp location (it may be locked)
     temp_dir = Path(tempfile.mkdtemp(prefix="chromium_passwords_"))
@@ -709,7 +925,7 @@ def decrypt_chromium_passwords(
                 password = decrypt_password(encrypted_password, key, app_bound_key) if encrypted_password else ""
             except V20EncryptionError:
                 v20_count += 1
-                password = "[v20 PROTECTED - Use browser export]"
+                password = "[v20 PROTECTED - Run as Admin]"
             except DecryptionFailed as e:
                 errors.append(f"Failed to decrypt password for {origin_url}: {e}")
                 password = "[DECRYPTION FAILED]"
@@ -749,11 +965,10 @@ def decrypt_chromium_passwords(
         conn.close()
         
         # Add warning about v20 encrypted passwords
-        if v20_count > 0:
+        if v20_count > 0 and not is_admin():
             errors.insert(0, 
-                f"{v20_count} password(s) use Chrome 127+ App-Bound Encryption (v20). "
-                f"These require the browser's export feature to decrypt. "
-                f"Go to: Settings > Passwords > Export Passwords"
+                f"{v20_count} password(s) use v20 encryption. "
+                f"Run as Administrator to decrypt."
             )
         
     except sqlite3.Error as e:
@@ -778,16 +993,12 @@ def check_decryption_requirements() -> Tuple[bool, List[str]]:
     # Check for pycryptodome
     try:
         from Crypto.Cipher import AES
-        from Crypto.Protocol.KDF import PBKDF2
     except ImportError:
         missing.append("pycryptodome (pip install pycryptodome)")
     
-    # Linux-specific checks
-    if sys.platform == "linux":
-        try:
-            import secretstorage
-        except ImportError:
-            missing.append("secretstorage (pip install secretstorage) - optional, for GNOME keyring")
+    # Check for v20 admin support
+    if not _check_v20_dependencies():
+        missing.append("PythonForWindows (pip install PythonForWindows) - for v20 admin decryption")
     
     return len(missing) == 0, missing
 
@@ -799,14 +1010,14 @@ def check_decryption_requirements() -> Tuple[bool, List[str]]:
 if __name__ == "__main__":
     from browser_profiles import detect_all_browsers, BrowserFamily
     
-    print("Chromium Password Decryption Test")
+    print("Chromium Password Decryption Test (Windows)")
     print("=" * 50)
+    print(f"Running as Admin: {is_admin()}")
     
     # Check requirements
     reqs_met, missing = check_decryption_requirements()
     if not reqs_met:
-        print(f"Missing requirements: {missing}")
-        print("Some features may not work.")
+        print(f"Missing: {missing}")
     
     # Find a Chromium browser
     installations = detect_all_browsers()
@@ -814,31 +1025,26 @@ if __name__ == "__main__":
     for inst in installations:
         if inst.browser_family == BrowserFamily.CHROMIUM and inst.profiles:
             profile = inst.profiles[0]
-            print(f"\nTesting with: {profile.display_name}")
-            print(f"Profile path: {profile.profile_path}")
-            print(f"User data dir: {profile.user_data_dir}")
+            browser = inst.browser_type.value.lower()
+            print(f"\nTesting: {profile.display_name} ({browser})")
             
-            try:
-                credentials, errors = decrypt_chromium_passwords(
-                    profile.profile_path,
-                    profile.user_data_dir
-                )
-                
-                print(f"\nDecrypted {len(credentials)} credentials")
-                
-                for cred in credentials[:5]:  # Show first 5
-                    print(f"  - {cred.signon_realm}")
-                    print(f"    User: {cred.username}")
-                    print(f"    Pass: {'*' * len(cred.password) if cred.password else '[empty]'}")
-                
-                if len(credentials) > 5:
-                    print(f"  ... and {len(credentials) - 5} more")
-                
-                if errors:
-                    print(f"\nErrors: {errors}")
-                    
-            except Exception as e:
-                print(f"Error: {e}")
+            # Check for v20
+            has_v20, v20_pass, v20_cook = has_v20_encrypted_data(profile.profile_path)
+            if has_v20:
+                print(f"  v20 data found: {v20_pass} passwords, {v20_cook} cookies")
+                if not is_admin():
+                    print("  [!] Run as Administrator to decrypt v20 data")
+            
+            credentials, errors = decrypt_chromium_passwords(
+                profile.profile_path, profile.user_data_dir, browser_name=browser
+            )
+            
+            print(f"  Passwords: {len(credentials)}")
+            for cred in credentials[:3]:
+                print(f"    {cred.url[:40]}... | {cred.username} | {cred.password}")
+            
+            if errors:
+                print(f"  Errors: {errors[0][:80]}...")
             
             break
     else:
