@@ -12,78 +12,198 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Platform detection
+IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
+IS_MACOS = sys.platform == "darwin"
 
-# Auto Dependency Installer
-def check_and_install_dependencies():
-    missing = []
+# ANSI color codes
+class Colors:
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    CYAN = "\033[96m"
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
 
-    # Check pycryptodome (required for Chromium password decryption)
+
+def get_venv_python(venv_dir: Path) -> Path:
+    """Get the Python executable path for a venv based on OS."""
+    if IS_WINDOWS:
+        return venv_dir / "Scripts" / "python.exe"
+    else:
+        return venv_dir / "bin" / "python"
+
+
+def is_in_venv() -> bool:
+    """Check if currently running inside a virtual environment."""
+    return (
+        hasattr(sys, 'real_prefix') or  # virtualenv
+        (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)  # venv
+    )
+
+
+def get_required_packages() -> Tuple[list, list]:
+    """Get list of (required, optional) packages based on OS."""
+    required = ["pycryptodome"]
+    optional = []
+    
+    if IS_LINUX:
+        required.append("secretstorage")
+    elif IS_WINDOWS:
+        # PythonForWindows is optional (only for v20 admin decryption)
+        optional.append("PythonForWindows")
+    
+    return required, optional
+
+
+def check_dependencies() -> Tuple[list, list]:
+    """Check which dependencies are missing. Returns (missing_required, missing_optional)."""
+    missing_required = []
+    missing_optional = []
+    
+    # Required: pycryptodome (for AES decryption)
     try:
         from Crypto.Cipher import AES  # type: ignore
-    except Exception:
-        missing.append("pycryptodome")
-
-    # Check PythonForWindows (for v20 admin decryption)
-    try:
-        import windows  # type: ignore
-    except Exception:
-        missing.append("PythonForWindows")
-
-    if not missing:
-        return
-
-    print(f"\033[93m[!] Missing dependencies: {', '.join(missing)}\033[0m")
-    print(f"\033[96m[*] Installing automatically...\033[0m")
-
-    def try_pip_install(python_exe: str, pkgs: list, user: bool = False) -> bool:
-        cmd_base = [python_exe, "-m", "pip", "install", "--quiet"]
-        if user:
-            cmd_base.append("--user")
+    except ImportError:
+        missing_required.append("pycryptodome")
+    
+    # Linux: secretstorage (required for keyring access)
+    if IS_LINUX:
         try:
-            for pkg in pkgs:
-                subprocess.check_call(cmd_base + [pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return True
-        except subprocess.CalledProcessError:
-            return False
+            import secretstorage  # type: ignore
+        except ImportError:
+            missing_required.append("secretstorage")
+    
+    # Windows: PythonForWindows (optional - for v20 admin decryption)
+    if IS_WINDOWS:
+        try:
+            import windows  # type: ignore
+        except ImportError:
+            missing_optional.append("PythonForWindows")
+    
+    return missing_required, missing_optional
 
-    # First attempt: install into current Python environment
-    if try_pip_install(sys.executable, missing):
-        print(f"\033[92m[+] Dependencies installed successfully!\033[0m\n")
+
+def setup_environment():
+    """Auto-setup: create venv if needed, install dependencies, and re-exec."""
+    script_dir = Path(__file__).parent.resolve()
+    venv_dir = script_dir / ".venv"
+    venv_python = get_venv_python(venv_dir)
+    
+    # Check current state
+    missing_required, missing_optional = check_dependencies()
+    
+    # Case 1: All required deps present - just show optional warning
+    if not missing_required:
+        if missing_optional:
+            print(f"{Colors.YELLOW}[!] Missing dependencies: {', '.join(missing_optional)}{Colors.RESET}")
+            print(f"{Colors.CYAN}[*] Installing automatically...{Colors.RESET}")
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--quiet"] + missing_optional,
+                    capture_output=True, check=False
+                )
+                print(f"{Colors.GREEN}[+] Dependencies installed successfully!{Colors.RESET}\n")
+            except Exception:
+                pass  # Optional deps, don't fail
         return
-
-    # If pip failed, it may be due to PEP 668 (externally-managed-environment).
-    # Try creating a local virtualenv and installing packages there, then re-exec the script.
-    venv_dir = Path(".venv")
-    venv_python = venv_dir / "bin" / "python"
-
+    
+    # Case 2: In venv but missing deps - install them
+    if is_in_venv():
+        all_missing = missing_required + missing_optional
+        print(f"{Colors.YELLOW}[!] Missing dependencies: {', '.join(all_missing)}{Colors.RESET}")
+        print(f"{Colors.CYAN}[*] Installing into virtual environment...{Colors.RESET}")
+        
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet"] + all_missing,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print(f"{Colors.GREEN}[+] Dependencies installed successfully!{Colors.RESET}\n")
+        except subprocess.CalledProcessError:
+            print(f"{Colors.RED}[!] Failed to install. Run manually:{Colors.RESET}")
+            print(f"    pip install {' '.join(all_missing)}\n")
+        return
+    
+    # Case 3: Not in venv and missing required deps - setup venv
+    print(f"{Colors.YELLOW}[!] Missing required dependencies: {', '.join(missing_required)}{Colors.RESET}")
+    
+    # Create venv if needed
+    if not venv_python.exists():
+        print(f"{Colors.CYAN}[*] Creating virtual environment...{Colors.RESET}")
+        try:
+            # Remove partial venv if exists
+            if venv_dir.exists():
+                shutil.rmtree(venv_dir)
+            
+            # Create fresh venv
+            subprocess.check_call(
+                [sys.executable, "-m", "venv", str(venv_dir)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            
+            # Upgrade pip silently
+            subprocess.run(
+                [str(venv_python), "-m", "pip", "install", "--upgrade", "--quiet", "pip"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False
+            )
+            print(f"{Colors.GREEN}[+] Virtual environment created: .venv{Colors.RESET}")
+        except subprocess.CalledProcessError as e:
+            print(f"{Colors.RED}[!] Failed to create virtual environment{Colors.RESET}")
+            print(f"\nManual setup:")
+            print(f"  python -m venv .venv")
+            if IS_WINDOWS:
+                print(f"  .venv\\Scripts\\activate")
+            else:
+                print(f"  source .venv/bin/activate")
+            required, optional = get_required_packages()
+            print(f"  pip install {' '.join(required + optional)}\n")
+            sys.exit(1)
+    else:
+        print(f"{Colors.CYAN}[*] Using existing virtual environment: .venv{Colors.RESET}")
+    
+    # Install all packages
+    required, optional = get_required_packages()
+    all_packages = required + optional
+    print(f"{Colors.CYAN}[*] Installing: {', '.join(all_packages)}{Colors.RESET}")
+    
     try:
-        print(f"\033[93m[!] System pip install failed; creating virtualenv at {venv_dir}\033[0m")
-        subprocess.check_call([sys.executable, "-m", "venv", str(venv_dir)])
-        # Upgrade pip quietly in the venv to avoid old pip issues
-        subprocess.check_call([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if try_pip_install(str(venv_python), missing):
-            print(f"\033[92m[+] Installed dependencies into {venv_dir}\033[0m")
-            print(f"\033[96m[*] Re-running using virtualenv Python: {venv_python}\033[0m\n")
-            os.execv(str(venv_python), [str(venv_python)] + sys.argv)
-        else:
-            raise RuntimeError("Failed to install into virtualenv")
-    except Exception:
-        # Fallback: try user-level install
-        print(f"\033[93m[!] Virtualenv install failed; attempting user-level install (--user)\033[0m")
-        if try_pip_install(sys.executable, missing, user=True):
-            print(f"\033[92m[+] Dependencies installed with --user. You may need to ensure your PATH includes user site-packages/bin.\033[0m\n")
-            return
-        # Final fallback: instruct user
-        print(f"\033[91m[!] Automatic installation failed.\033[0m")
-        print("\nPlease create and activate a virtual environment, then run:\n")
-        print(f"  python -m venv .venv")
-        print(f"  source .venv/bin/activate")
-        print(f"  pip install {' '.join(missing)}\n")
-        print(f"Or install manually: pip install {' '.join(missing)}\n")
+        subprocess.check_call(
+            [str(venv_python), "-m", "pip", "install", "--quiet"] + all_packages,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        print(f"{Colors.GREEN}[+] Dependencies installed!{Colors.RESET}")
+    except subprocess.CalledProcessError:
+        # Try required only
+        try:
+            subprocess.check_call(
+                [str(venv_python), "-m", "pip", "install", "--quiet"] + required,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print(f"{Colors.GREEN}[+] Required dependencies installed!{Colors.RESET}")
+        except subprocess.CalledProcessError:
+            print(f"{Colors.RED}[!] Failed to install dependencies{Colors.RESET}")
+            sys.exit(1)
+    
+    # Re-execute with venv Python
+    print(f"{Colors.CYAN}[*] Restarting with virtual environment...{Colors.RESET}\n")
+    
+    # Get the script path
+    script_path = Path(sys.argv[0]).resolve()
+    args = [str(venv_python), str(script_path)] + sys.argv[1:]
+    
+    if IS_WINDOWS:
+        # Windows: subprocess + exit
+        result = subprocess.run(args)
+        sys.exit(result.returncode)
+    else:
+        # Linux/macOS: execv for clean replacement
+        os.execv(str(venv_python), args)
 
 
-# Run dependency check on import
-check_and_install_dependencies()
+# Run environment setup immediately
+setup_environment()
 
 from browser_profiles import (
     BrowserProfile, BrowserType, BrowserFamily, BrowserInstallation,
