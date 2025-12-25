@@ -1,29 +1,16 @@
-"""Forensic SQL queries for browser profile extraction.
+"""SQL queries for Firefox and Chromium browsers."""
 
-Combined queries for Firefox (Gecko) and Chromium-based browsers.
-"""
-
-# =============================================================================
-# WebKit Timestamp Conversion (Chromium)
-# =============================================================================
-# Chromium uses WebKit timestamps (microseconds since 1601-01-01)
-# Unix epoch is 1970-01-01
-# Difference: 11644473600 seconds
-
+# WebKit timestamp: microseconds since 1601-01-01. Unix epoch diff: 11644473600s
 WEBKIT_TO_UNIX = 11644473600
 
 
 def webkit_to_unix(webkit_timestamp: int) -> int:
-    """Convert WebKit timestamp to Unix timestamp."""
     if webkit_timestamp == 0:
         return 0
     return (webkit_timestamp // 1000000) - WEBKIT_TO_UNIX
 
 
-# =============================================================================
-# FIREFOX QUERIES (places.sqlite, cookies.sqlite, etc.)
-# =============================================================================
-
+# FIREFOX QUERIES
 FIREFOX_QUERIES = {
     "places.sqlite": {
         "browsing_history": """
@@ -157,11 +144,7 @@ FIREFOX_QUERIES = {
     },
 }
 
-
-# =============================================================================
-# CHROMIUM QUERIES (History, Cookies, Login Data, etc.)
-# =============================================================================
-
+# CHROMIUM QUERIES
 CHROMIUM_QUERIES = {
     "History": {
         "browsing_history": """
