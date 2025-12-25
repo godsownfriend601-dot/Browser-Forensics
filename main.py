@@ -16,36 +16,70 @@ from typing import Dict, List, Optional, Tuple
 # Auto Dependency Installer
 def check_and_install_dependencies():
     missing = []
-    
+
     # Check pycryptodome (required for Chromium password decryption)
     try:
-        from Crypto.Cipher import AES
-    except ImportError:
+        from Crypto.Cipher import AES  # type: ignore
+    except Exception:
         missing.append("pycryptodome")
-    
+
     # Check PythonForWindows (for v20 admin decryption)
     try:
-        import windows
-    except ImportError:
+        import windows  # type: ignore
+    except Exception:
         missing.append("PythonForWindows")
-    
-    if missing:
-        print(f"\033[93m[!] Missing dependencies: {', '.join(missing)}\033[0m")
-        print(f"\033[96m[*] Installing automatically...\033[0m")
-        
+
+    if not missing:
+        return
+
+    print(f"\033[93m[!] Missing dependencies: {', '.join(missing)}\033[0m")
+    print(f"\033[96m[*] Installing automatically...\033[0m")
+
+    def try_pip_install(python_exe: str, pkgs: list, user: bool = False) -> bool:
+        cmd_base = [python_exe, "-m", "pip", "install", "--quiet"]
+        if user:
+            cmd_base.append("--user")
         try:
-            for pkg in missing:
-                subprocess.check_call(
-                    [sys.executable, "-m", "pip", "install", "--quiet", pkg],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-            print(f"\033[92m[+] Dependencies installed successfully!\033[0m\n")
+            for pkg in pkgs:
+                subprocess.check_call(cmd_base + [pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
         except subprocess.CalledProcessError:
-            print(f"\033[91m[!] Failed to install. Run: pip install {' '.join(missing)}\033[0m")
-            print(f"\033[93m[*] Continuing without v20 decryption support...\033[0m\n")
-        except Exception as e:
-            print(f"\033[91m[!] Install error: {e}\033[0m\n")
+            return False
+
+    # First attempt: install into current Python environment
+    if try_pip_install(sys.executable, missing):
+        print(f"\033[92m[+] Dependencies installed successfully!\033[0m\n")
+        return
+
+    # If pip failed, it may be due to PEP 668 (externally-managed-environment).
+    # Try creating a local virtualenv and installing packages there, then re-exec the script.
+    venv_dir = Path(".venv")
+    venv_python = venv_dir / "bin" / "python"
+
+    try:
+        print(f"\033[93m[!] System pip install failed; creating virtualenv at {venv_dir}\033[0m")
+        subprocess.check_call([sys.executable, "-m", "venv", str(venv_dir)])
+        # Upgrade pip quietly in the venv to avoid old pip issues
+        subprocess.check_call([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if try_pip_install(str(venv_python), missing):
+            print(f"\033[92m[+] Installed dependencies into {venv_dir}\033[0m")
+            print(f"\033[96m[*] Re-running using virtualenv Python: {venv_python}\033[0m\n")
+            os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+        else:
+            raise RuntimeError("Failed to install into virtualenv")
+    except Exception:
+        # Fallback: try user-level install
+        print(f"\033[93m[!] Virtualenv install failed; attempting user-level install (--user)\033[0m")
+        if try_pip_install(sys.executable, missing, user=True):
+            print(f"\033[92m[+] Dependencies installed with --user. You may need to ensure your PATH includes user site-packages/bin.\033[0m\n")
+            return
+        # Final fallback: instruct user
+        print(f"\033[91m[!] Automatic installation failed.\033[0m")
+        print("\nPlease create and activate a virtual environment, then run:\n")
+        print(f"  python -m venv .venv")
+        print(f"  source .venv/bin/activate")
+        print(f"  pip install {' '.join(missing)}\n")
+        print(f"Or install manually: pip install {' '.join(missing)}\n")
 
 
 # Run dependency check on import
