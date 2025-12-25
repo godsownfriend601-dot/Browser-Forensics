@@ -3,11 +3,29 @@
 import json
 import shutil
 import sqlite3
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from sql_queries import FIREFOX_QUERIES, CHROMIUM_QUERIES
+
+# Import decryption functions
+try:
+    from chromium_decrypt import (
+        decrypt_chromium_passwords,
+        decrypt_chromium_cookies,
+        get_encryption_key,
+        get_app_bound_key_windows,
+        decrypt_cookie,
+        DecryptedCredential,
+        DecryptedCookie,
+        V20EncryptionError,
+        DecryptionFailed,
+    )
+    DECRYPTION_AVAILABLE = True
+except ImportError:
+    DECRYPTION_AVAILABLE = False
 
 
 class FirefoxExtractor:
@@ -245,11 +263,86 @@ class ChromiumExtractor:
         return []
 
     def get_cookies(self) -> List[Dict[str, Any]]:
-        """Get all cookies."""
+        """Get all cookies (encrypted values included but not decrypted)."""
         if "Cookies" in CHROMIUM_QUERIES:
             rows, _ = self.run_query("Cookies", CHROMIUM_QUERIES["Cookies"]["all_cookies"])
             return rows
         return []
+
+    def get_decrypted_cookies(self, browser_name: str = "chrome") -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Get cookies with decrypted values.
+        
+        Args:
+            browser_name: Browser name for v20 key extraction (chrome, edge, brave)
+            
+        Returns:
+            Tuple of (list of cookie dicts with decrypted values, list of errors)
+        """
+        if not DECRYPTION_AVAILABLE:
+            return [], ["Cookie decryption not available - missing chromium_decrypt module"]
+        
+        try:
+            cookies, errors = decrypt_chromium_cookies(
+                self.profile_path,
+                self.user_data_dir,
+                browser_name
+            )
+            
+            # Convert DecryptedCookie objects to dicts
+            cookie_dicts = []
+            for cookie in cookies:
+                cookie_dicts.append({
+                    "host_key": cookie.host,
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "path": cookie.path,
+                    "expires": cookie.expires,
+                    "created": cookie.created,
+                    "is_secure": cookie.is_secure,
+                    "is_httponly": cookie.is_httponly,
+                })
+            
+            return cookie_dicts, errors
+            
+        except Exception as e:
+            return [], [f"Cookie decryption failed: {e}"]
+
+    def get_decrypted_passwords(self, browser_name: str = "chrome") -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Get passwords with decrypted values.
+        
+        Args:
+            browser_name: Browser name for v20 key extraction (chrome, edge, brave)
+            
+        Returns:
+            Tuple of (list of password dicts with decrypted values, list of errors)
+        """
+        if not DECRYPTION_AVAILABLE:
+            return [], ["Password decryption not available - missing chromium_decrypt module"]
+        
+        try:
+            credentials, errors = decrypt_chromium_passwords(
+                self.profile_path,
+                self.user_data_dir,
+                browser_name=browser_name
+            )
+            
+            # Convert DecryptedCredential objects to dicts
+            cred_dicts = []
+            for cred in credentials:
+                cred_dicts.append({
+                    "url": cred.url,
+                    "username": cred.username,
+                    "password": cred.password,
+                    "signon_realm": cred.signon_realm,
+                    "date_created": cred.date_created,
+                    "date_last_used": cred.date_last_used,
+                    "times_used": cred.times_used,
+                })
+            
+            return cred_dicts, errors
+            
+        except Exception as e:
+            return [], [f"Password decryption failed: {e}"]
 
     def get_downloads(self) -> List[Dict[str, Any]]:
         """Get downloads."""
