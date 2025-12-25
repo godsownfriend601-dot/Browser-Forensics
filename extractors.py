@@ -29,8 +29,6 @@ except ImportError:
 
 
 class FirefoxExtractor:
-    """Extract data from Firefox SQLite databases and JSON files."""
-
     def __init__(self, profile_path: Path):
         self.profile_path = Path(profile_path)
         if not self.profile_path.exists():
@@ -147,10 +145,7 @@ class FirefoxExtractor:
 
 
 class ChromiumExtractor:
-    """Extract data from Chromium-based browser databases.
-    
-    Creates temporary copies of databases since Chromium locks them while running.
-    """
+    """Creates temp copies of databases since Chromium locks them while running."""
 
     def __init__(self, profile_path: Path, user_data_dir: Path = None):
         self.profile_path = Path(profile_path)
@@ -270,14 +265,6 @@ class ChromiumExtractor:
         return []
 
     def get_decrypted_cookies(self, browser_name: str = "chrome") -> Tuple[List[Dict[str, Any]], List[str]]:
-        """Get cookies with decrypted values.
-        
-        Args:
-            browser_name: Browser name for v20 key extraction (chrome, edge, brave)
-            
-        Returns:
-            Tuple of (list of cookie dicts with decrypted values, list of errors)
-        """
         if not DECRYPTION_AVAILABLE:
             return [], ["Cookie decryption not available - missing chromium_decrypt module"]
         
@@ -308,14 +295,6 @@ class ChromiumExtractor:
             return [], [f"Cookie decryption failed: {e}"]
 
     def get_decrypted_passwords(self, browser_name: str = "chrome") -> Tuple[List[Dict[str, Any]], List[str]]:
-        """Get passwords with decrypted values.
-        
-        Args:
-            browser_name: Browser name for v20 key extraction (chrome, edge, brave)
-            
-        Returns:
-            Tuple of (list of password dicts with decrypted values, list of errors)
-        """
         if not DECRYPTION_AVAILABLE:
             return [], ["Password decryption not available - missing chromium_decrypt module"]
         
