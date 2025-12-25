@@ -1,14 +1,4 @@
-"""
-HTML Report Generator for Browser Forensics Tool.
-
-Generates professional forensics reports in HTML format with:
-- Executive summary with key statistics
-- Searchable and sortable data tables
-- Password masking with reveal functionality
-- Evidence traceability
-- Print-optimized styling
-- Accessibility features
-"""
+"""HTML Report Generator - Generates professional forensics reports."""
 
 import html
 import hashlib
@@ -24,16 +14,6 @@ def generate_html_report(
     output_path: Path,
     errors: List[str] = None,
 ) -> None:
-    """
-    Generate a professional HTML forensics report.
-    
-    Args:
-        browser_name: Name of the browser (e.g., "Firefox", "Chrome")
-        profile_path: Path to the browser profile
-        data: Dictionary containing extracted data by category
-        output_path: Path where the HTML report will be saved
-        errors: List of errors/warnings encountered during extraction
-    """
     errors = errors or []
     timestamp = datetime.now(timezone.utc)
     timestamp_iso = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -69,7 +49,6 @@ def generate_html_report(
 
 
 def _calculate_stats(data: Dict) -> Dict[str, int]:
-    """Calculate statistics from extracted data."""
     return {
         'passwords': len(data.get('passwords', [])),
         'cookies': len(data.get('cookies', [])),
@@ -93,7 +72,6 @@ def _build_document(
     errors: List[str],
     decryption_status: str,
 ) -> str:
-    """Build the complete HTML document."""
     
     css = _get_css()
     js = _get_javascript()
@@ -169,7 +147,6 @@ def _build_document(
 
 
 def _get_css() -> str:
-    """Return the CSS styles."""
     return '''
 :root {
     --bg-primary: #f5f5f5;
@@ -727,7 +704,6 @@ body.redacted .pwd-btn { display: none; }
 
 
 def _get_javascript() -> str:
-    """Return the JavaScript code."""
     return '''
 // State
 let redactionEnabled = false;
@@ -896,7 +872,6 @@ def _build_executive_summary(
     decryption_status: str,
     errors: List[str],
 ) -> str:
-    """Build the executive summary section."""
     
     status_class = {
         'SUCCESS': 'status-success',
@@ -970,7 +945,6 @@ def _build_executive_summary(
 
 
 def _build_error_section(errors: List[str]) -> str:
-    """Build the errors and warnings section."""
     if not errors:
         return ""
     
@@ -991,7 +965,6 @@ def _build_metadata_section(
     timestamp_iso: str,
     timestamp_display: str,
 ) -> str:
-    """Build the extraction metadata section."""
     return f'''
     <section class="data-section">
         <div class="section-header">
@@ -1032,7 +1005,6 @@ def _build_metadata_section(
 
 
 def _build_credentials_section(records: List, profile_path: Path) -> str:
-    """Build the credentials section with special handling."""
     if not records:
         return ""
     
@@ -1104,7 +1076,6 @@ def _build_credentials_section(records: List, profile_path: Path) -> str:
 
 
 def _build_data_section(category: str, records: List[Dict], profile_path: Path, collapsed: bool = False) -> str:
-    """Build a generic data section with table."""
     if not records or not isinstance(records[0], dict):
         return ''
     
