@@ -6,12 +6,14 @@ Requires: pycryptodome, PythonForWindows (v20), secretstorage (Linux keyring)
 """
 
 import base64
+import hashlib
 import io
 import json
 import os
 import sqlite3
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -26,6 +28,32 @@ IS_LINUX = sys.platform.startswith("linux")
 if IS_WINDOWS:
     import ctypes
     from ctypes import wintypes
+
+
+# Terminal Colors
+class Colors:
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+
+def colored(text: str, color: str) -> str:
+    """Return colored text for terminal output."""
+    return f"{color}{text}{Colors.RESET}"
+
+def success(text: str) -> str:
+    """Return green success text."""
+    return colored(text, Colors.GREEN)
+
+def error(text: str) -> str:
+    """Return red error text."""
+    return colored(text, Colors.RED)
+
+def warning(text: str) -> str:
+    """Return yellow warning text."""
+    return colored(text, Colors.YELLOW)
 
 
 @dataclass
@@ -172,7 +200,7 @@ if IS_LINUX:
         
         if "kde" in xdg_current or "plasma" in xdg_current or kde_full_session:
             return "kde"
-        elif "gnome" in xdg_current or "unity" in xdg_current or gnome_session:
+        elif "gnome" in xdg_current or "unity" in xdg_current or gnome_session or "gnome" in desktop_session:
             return "gnome"
         elif "xfce" in xdg_current or "xfce" in desktop_session:
             return "xfce"  # Usually uses GNOME Keyring
@@ -194,6 +222,10 @@ if IS_LINUX:
             result = subprocess.run(["pgrep", "-x", "gnome-keyring-daemon"], capture_output=True)
             if result.returncode == 0:
                 return "gnome"
+            # Check for systemd user service (common on modern GNOME)
+            result = subprocess.run(["systemctl", "--user", "is-active", "gnome-keyring-daemon.service"], capture_output=True)
+            if result.returncode == 0:
+                return "gnome"
         except Exception:
             pass
         
@@ -210,7 +242,7 @@ if IS_LINUX:
             
             # Also try libsecret v2 schema names (older format)
             browser_schemas = {
-                "chrome": "chrome_libsecret_os_crypt_password_v2",
+                "chrome": "chromium_libsecret_os_crypt_password_v2",
                 "chromium": "chromium_libsecret_os_crypt_password_v2",
                 "brave": "brave_libsecret_os_crypt_password_v2",
                 "edge": "edge_libsecret_os_crypt_password_v2",
@@ -218,31 +250,61 @@ if IS_LINUX:
                 "vivaldi": "vivaldi_libsecret_os_crypt_password_v2",
             }
             schema_name = browser_schemas.get(
-                browser.lower(), "chrome_libsecret_os_crypt_password_v2"
+                browser.lower(), "chromium_libsecret_os_crypt_password_v2"
             )
             
-            bus = secretstorage.dbus_init()
-            collection = secretstorage.get_default_collection(bus)
+            try:
+                bus = secretstorage.dbus_init()
+            except Exception:
+                # D-Bus connection failed - likely no keyring running
+                return None
+            
+            try:
+                collection = secretstorage.get_default_collection(bus)
+            except Exception:
+                # No default collection available
+                return None
             
             # Unlock collection if locked
-            if collection.is_locked():
-                collection.unlock()
+            try:
+                if collection.is_locked():
+                    collection.unlock()
+            except Exception:
+                pass  # Might fail if no interactive unlock available
             
             # First try: exact Safe Storage label match
-            for item in collection.get_all_items():
-                if item.get_label() == safe_storage_label:
-                    return item.get_secret()
+            try:
+                for item in collection.get_all_items():
+                    try:
+                        if item.get_label() == safe_storage_label:
+                            return item.get_secret()
+                    except Exception:
+                        continue
+            except Exception:
+                pass
             
             # Second try: libsecret schema name
-            for item in collection.get_all_items():
-                if item.get_label() == schema_name:
-                    return item.get_secret()
+            try:
+                for item in collection.get_all_items():
+                    try:
+                        if item.get_label() == schema_name:
+                            return item.get_secret()
+                    except Exception:
+                        continue
+            except Exception:
+                pass
             
             # Third try: fuzzy match on browser name + safe storage
-            for item in collection.get_all_items():
-                label = item.get_label().lower()
-                if browser.lower() in label and "safe storage" in label:
-                    return item.get_secret()
+            try:
+                for item in collection.get_all_items():
+                    try:
+                        label = item.get_label().lower()
+                        if browser.lower() in label and "safe storage" in label:
+                            return item.get_secret()
+                    except Exception:
+                        continue
+            except Exception:
+                pass
                     
         except ImportError:
             pass  # secretstorage not installed
@@ -414,6 +476,16 @@ if IS_LINUX:
         # CLI fallback: secret-tool works with both backends
         if not password:
             password = _secret_tool_get_password(browser)
+        
+        # For unknown desktop or any system, try CLI tools as last resort
+        if not password and desktop == "unknown":
+            password = _secret_tool_get_password(browser)
+            if not password:
+                password = _gnome_keyring_get_password(browser)
+            if not password:
+                password = _kwallet_get_password_dbus(browser)
+            if not password:
+                password = _kwallet_get_password_cli(browser)
         
         return password
 
@@ -801,6 +873,105 @@ if IS_LINUX:
         
         return _linux_derive_key(password), source
     
+    def get_encryption_key_linux_with_fallback(user_data_dir: Path, browser_name: str = "chrome") -> Tuple[List[bytes], List[str]]:
+        """
+        Get multiple encryption keys to try (primary + fallbacks).
+        
+        Returns: (keys_list, sources_list) where each is ordered by preference
+        """
+        keys = []
+        sources = []
+        seen_keys = set()
+        
+        # Try 1: GNOME Keyring with browser name
+        password = _linux_get_keyring_password(browser_name)
+        if password:
+            key = _linux_derive_key(password)
+            key_hash = hashlib.sha256(key).digest()
+            if key_hash not in seen_keys:
+                keys.append(key)
+                sources.append(f"gnome-keyring[{browser_name}]")
+                seen_keys.add(key_hash)
+        
+        # Try 2: Try common browser name variations
+        browser_variations = [
+            browser_name.lower(),
+            "chrome",
+            "chromium",
+            "brave",
+            "brave-browser",
+            "google-chrome",
+            "microsoft-edge",
+            "vivaldi"
+        ]
+        
+        for browser_var in browser_variations:
+            if browser_var != browser_name:
+                try:
+                    passwd = _linux_get_keyring_password(browser_var)
+                    if passwd:
+                        key = _linux_derive_key(passwd)
+                        key_hash = hashlib.sha256(key).digest()
+                        if key_hash not in seen_keys:
+                            keys.append(key)
+                            sources.append(f"gnome-keyring[{browser_var}]")
+                            seen_keys.add(key_hash)
+                except:
+                    pass
+        
+        # Try 3: Empty password (some browsers use this)
+        try:
+            empty_key = _linux_derive_key(b"")
+            key_hash = hashlib.sha256(empty_key).digest()
+            if key_hash not in seen_keys:
+                keys.append(empty_key)
+                sources.append("empty-password")
+                seen_keys.add(key_hash)
+        except:
+            pass
+        
+        # Try 4: Default 'peanuts' password
+        peanuts_key = _linux_derive_key(LINUX_DEFAULT_PASSWORD)
+        key_hash = hashlib.sha256(peanuts_key).digest()
+        if key_hash not in seen_keys:
+            keys.append(peanuts_key)
+            sources.append("peanuts-default")
+            seen_keys.add(key_hash)
+        
+        # Try 5: Try extracting encrypted_key from Local State if it exists
+        try:
+            local_state_path = user_data_dir / "Local State"
+            if local_state_path.exists():
+                with open(local_state_path, 'r') as f:
+                    local_state = json.load(f)
+                    encrypted_key_b64 = local_state.get("os_crypt", {}).get("encrypted_key")
+                    if encrypted_key_b64:
+                        # This is already encrypted with one of the above passwords
+                        # But we try to extract it with all known methods
+                        import base64
+                        encrypted_key = base64.b64decode(encrypted_key_b64)
+                        if encrypted_key[:3] == b'v10':
+                            # v10 encrypted key - try decrypting with all passwords we have
+                            for i, test_key in enumerate(keys[:]):  # Copy to avoid modification during iteration
+                                try:
+                                    nonce = encrypted_key[3:15]
+                                    ciphertext = encrypted_key[15:]
+                                    cipher = AES.new(test_key, AES.MODE_GCM, nonce=nonce)
+                                    decrypted_key = cipher.decrypt_and_verify(ciphertext[:-16], ciphertext[-16:])
+                                    if len(decrypted_key) >= 32:
+                                        actual_key = decrypted_key[-32:] if len(decrypted_key) > 32 else decrypted_key
+                                        key_hash = hashlib.sha256(actual_key).digest()
+                                        if key_hash not in seen_keys:
+                                            keys.append(actual_key)
+                                            sources.append(f"local-state-v10[via {sources[i]}]")
+                                            seen_keys.add(key_hash)
+                                except:
+                                    pass
+        except:
+            pass
+        
+        return keys, sources
+    
     def get_encryption_key_linux_simple(user_data_dir: Path, browser_name: str = "chrome") -> bytes:
         """Get key from keyring or use 'peanuts' fallback (simple version)."""
         key, _ = get_encryption_key_linux(user_data_dir, browser_name)
@@ -906,8 +1077,26 @@ if IS_LINUX:
         
         # v10 format: AES-GCM (less common on Linux but possible)
         if encrypted_password[:3] == b"v10":
+            data = encrypted_password[3:]
+            
+            # Handle malformed v10 data (truncated/corrupted)
+            if len(data) == 16:
+                # Only 16 bytes = tag only, likely empty password
+                # Try to verify tag against empty ciphertext
+                try:
+                    cipher = AES.new(key, AES.MODE_GCM, nonce=b'\x00' * 12)
+                    cipher.decrypt_and_verify(b'', data)
+                    return ""  # Successfully verified empty password
+                except:
+                    pass
+                raise DecryptionFailed(f"v10 malformed: only tag present (16 bytes), expected ≥28 bytes")
+            
+            elif len(data) < 28:
+                # Too short for valid v10: need nonce(12) + ciphertext(≥1) + tag(16)
+                raise DecryptionFailed(f"v10 malformed: {len(data)} bytes, expected ≥28 bytes (nonce+ciphertext+tag)")
+            
             try:
-                return _aes_gcm_decrypt(encrypted_password[3:], key).decode("utf-8")
+                return _aes_gcm_decrypt(data, key).decode("utf-8")
             except Exception as e:
                 raise DecryptionFailed(f"AES-GCM decryption failed: {e}")
         
@@ -926,6 +1115,41 @@ def decrypt_password(encrypted_password: bytes, key: bytes, app_bound_key: bytes
         return decrypt_password_linux(encrypted_password, key)
     else:
         raise DependencyMissing(f"Unsupported platform: {sys.platform}")
+
+
+def decrypt_password_try_keys(encrypted_password: bytes, keys: List[bytes], sources: List[str] = None, verbose: bool = False, app_bound_key: bytes = None) -> Tuple[Optional[str], str]:
+    """Try to decrypt password with multiple keys. Returns (decrypted_password, key_source) or (None, error_msg)."""
+    if not encrypted_password:
+        return "", "empty"
+    
+    if verbose:
+        version = encrypted_password[:3] if len(encrypted_password) >= 3 else b"???"
+        print(f"    [DEBUG] Encrypted data version: {version}, length: {len(encrypted_password)} bytes")
+        print(f"    [DEBUG] Trying {len(keys)} different encryption keys...")
+    
+    if IS_LINUX:
+        for i, key in enumerate(keys):
+            try:
+                if verbose:
+                    source_name = sources[i] if sources and i < len(sources) else f"key-{i}"
+                    print(f"    [DEBUG] Attempt {i+1}/{len(keys)}: {source_name}... ", end='')
+                password = decrypt_password_linux(encrypted_password, key)
+                if verbose:
+                    print(success("✓ SUCCESS"))
+                return password, sources[i] if sources and i < len(sources) else f"key-{i}"
+            except (DecryptionFailed, Exception) as e:
+                if verbose:
+                    print(error(f"✗ Failed ({type(e).__name__})"))
+                continue
+        if verbose:
+            print(error("    [DEBUG] All decryption attempts failed"))
+        return None, "all-keys-failed"
+    else:
+        # Windows/Mac: use single key
+        try:
+            return decrypt_password(encrypted_password, keys[0] if keys else b"", app_bound_key), "single-key"
+        except:
+            return None, "decryption-failed"
 
 
 # Cookie Decryption
@@ -1159,7 +1383,12 @@ def decrypt_chromium_passwords(
     
     # Get decryption key
     try:
-        key = get_encryption_key(user_data_dir, browser_name)
+        if IS_LINUX:
+            keys, sources = get_encryption_key_linux_with_fallback(user_data_dir, browser_name)
+        else:
+            key = get_encryption_key(user_data_dir, browser_name)
+            keys = [key]
+            sources = ["windows-dpapi"]
     except (EncryptionKeyNotFound, DependencyMissing) as e:
         errors.append(str(e))
         return credentials, errors
@@ -1221,14 +1450,23 @@ def decrypt_chromium_passwords(
             times_used = row[7] or 0
             
             # Decrypt password
-            try:
-                password = decrypt_password(encrypted_password, key, app_bound_key) if encrypted_password else ""
-            except V20EncryptionError:
-                v20_count += 1
-                password = "[v20 PROTECTED - Run as Admin]"
-            except DecryptionFailed as e:
-                errors.append(f"Failed to decrypt password for {origin_url}: {e}")
-                password = "[DECRYPTION FAILED]"
+            if encrypted_password:
+                if IS_LINUX and len(keys) > 1:
+                    # Try multiple keys on Linux
+                    password, key_source = decrypt_password_try_keys(encrypted_password, keys, sources, verbose=True, app_bound_key=app_bound_key)
+                    if password is None:
+                        password = "[DECRYPTION FAILED]"
+                else:
+                    # Single key (Windows/Mac)
+                    try:
+                        password = decrypt_password(encrypted_password, keys[0] if keys else b"", app_bound_key) if encrypted_password else ""
+                    except V20EncryptionError:
+                        v20_count += 1
+                        password = "[v20 PROTECTED - Run as Admin]"
+                    except DecryptionFailed as e:
+                        password = "[DECRYPTION FAILED]"
+            else:
+                password = ""
             
             # Convert timestamps
             from sql_queries import webkit_to_unix
