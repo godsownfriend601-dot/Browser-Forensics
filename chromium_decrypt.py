@@ -59,6 +59,45 @@ class V20EncryptionError(DecryptionFailed): pass
 class AdminRequired(ChromiumDecryptionError): pass
 
 
+def check_linux_keyring_deps() -> Dict[str, bool]:
+    """Check available Linux keyring backends."""
+    if not IS_LINUX:
+        return {}
+    
+    deps = {
+        "secretstorage": False,
+        "dbus": False,
+        "kwallet-query": False,
+        "secret-tool": False,
+    }
+    
+    try:
+        import secretstorage
+        deps["secretstorage"] = True
+    except ImportError:
+        pass
+    
+    try:
+        import dbus
+        deps["dbus"] = True
+    except ImportError:
+        pass
+    
+    try:
+        result = subprocess.run(["which", "kwallet-query"], capture_output=True)
+        deps["kwallet-query"] = result.returncode == 0
+    except Exception:
+        pass
+    
+    try:
+        result = subprocess.run(["which", "secret-tool"], capture_output=True)
+        deps["secret-tool"] = result.returncode == 0
+    except Exception:
+        pass
+    
+    return deps
+
+
 # Windows DPAPI
 if IS_WINDOWS:
     class DATA_BLOB(ctypes.Structure):
@@ -92,37 +131,102 @@ if IS_WINDOWS:
         return decrypted
 
 
-# Linux Keyring
+# Linux Keyring Support
+# Supports: GNOME Keyring (libsecret), KDE Wallet (kwallet), CLI tools, and fallback
 if IS_LINUX:
-    def _linux_get_keyring_password(browser: str = "chrome") -> Optional[bytes]:
+    # Browser-specific Safe Storage labels
+    BROWSER_SAFE_STORAGE = {
+        "chrome": "Chrome Safe Storage",
+        "chromium": "Chromium Safe Storage",
+        "brave": "Brave Safe Storage",
+        "edge": "Microsoft Edge Safe Storage",
+        "opera": "Opera Safe Storage",
+        "vivaldi": "Vivaldi Safe Storage",
+    }
+    
+    # KWallet folder and application names used by browsers
+    BROWSER_KWALLET_FOLDER = {
+        "chrome": "Chrome Keys",
+        "chromium": "Chromium Keys",
+        "brave": "Brave Keys",
+        "edge": "Microsoft Edge Keys",
+        "opera": "Opera Keys",
+        "vivaldi": "Vivaldi Keys",
+    }
+    
+    BROWSER_KWALLET_APP = {
+        "chrome": "chrome",
+        "chromium": "chromium",
+        "brave": "brave",
+        "edge": "microsoft-edge",
+        "opera": "opera",
+        "vivaldi": "vivaldi",
+    }
+
+    def _detect_desktop_environment() -> str:
+        """Detect current desktop environment."""
+        xdg_current = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+        desktop_session = os.environ.get("DESKTOP_SESSION", "").lower()
+        kde_full_session = os.environ.get("KDE_FULL_SESSION", "")
+        gnome_session = os.environ.get("GNOME_DESKTOP_SESSION_ID", "")
+        
+        if "kde" in xdg_current or "plasma" in xdg_current or kde_full_session:
+            return "kde"
+        elif "gnome" in xdg_current or "unity" in xdg_current or gnome_session:
+            return "gnome"
+        elif "xfce" in xdg_current or "xfce" in desktop_session:
+            return "xfce"  # Usually uses GNOME Keyring
+        elif "lxde" in xdg_current or "lxqt" in xdg_current:
+            return "lxde"
+        elif "mate" in xdg_current:
+            return "mate"  # Usually uses GNOME Keyring
+        elif "cinnamon" in xdg_current:
+            return "cinnamon"  # Uses GNOME Keyring
+        
+        # Check for running services
+        try:
+            result = subprocess.run(["pgrep", "-x", "kwalletd5"], capture_output=True)
+            if result.returncode == 0:
+                return "kde"
+            result = subprocess.run(["pgrep", "-x", "kwalletd6"], capture_output=True)
+            if result.returncode == 0:
+                return "kde"
+            result = subprocess.run(["pgrep", "-x", "gnome-keyring-daemon"], capture_output=True)
+            if result.returncode == 0:
+                return "gnome"
+        except Exception:
+            pass
+        
+        return "unknown"
+
+    def _gnome_keyring_get_password(browser: str) -> Optional[bytes]:
+        """Get password from GNOME Keyring using secretstorage (libsecret)."""
         try:
             import secretstorage
             
-            # Browser-specific Safe Storage labels (actual format used by browsers)
-            browser_safe_storage = {
-                "chrome": "Chrome Safe Storage",
-                "chromium": "Chromium Safe Storage", 
-                "brave": "Brave Safe Storage",
-                "edge": "Microsoft Edge Safe Storage",
-                "opera": "Opera Safe Storage",
-                "vivaldi": "Vivaldi Safe Storage",
-            }
+            safe_storage_label = BROWSER_SAFE_STORAGE.get(
+                browser.lower(), f"{browser.title()} Safe Storage"
+            )
             
             # Also try libsecret v2 schema names (older format)
             browser_schemas = {
                 "chrome": "chrome_libsecret_os_crypt_password_v2",
-                "chromium": "chromium_libsecret_os_crypt_password_v2", 
+                "chromium": "chromium_libsecret_os_crypt_password_v2",
                 "brave": "brave_libsecret_os_crypt_password_v2",
                 "edge": "edge_libsecret_os_crypt_password_v2",
                 "opera": "opera_libsecret_os_crypt_password_v2",
                 "vivaldi": "vivaldi_libsecret_os_crypt_password_v2",
             }
-            
-            safe_storage_label = browser_safe_storage.get(browser.lower(), f"{browser.title()} Safe Storage")
-            schema_name = browser_schemas.get(browser.lower(), "chrome_libsecret_os_crypt_password_v2")
+            schema_name = browser_schemas.get(
+                browser.lower(), "chrome_libsecret_os_crypt_password_v2"
+            )
             
             bus = secretstorage.dbus_init()
             collection = secretstorage.get_default_collection(bus)
+            
+            # Unlock collection if locked
+            if collection.is_locked():
+                collection.unlock()
             
             # First try: exact Safe Storage label match
             for item in collection.get_all_items():
@@ -134,7 +238,7 @@ if IS_LINUX:
                 if item.get_label() == schema_name:
                     return item.get_secret()
             
-            # Fallback: fuzzy match on browser name + safe storage
+            # Third try: fuzzy match on browser name + safe storage
             for item in collection.get_all_items():
                 label = item.get_label().lower()
                 if browser.lower() in label and "safe storage" in label:
@@ -146,6 +250,172 @@ if IS_LINUX:
             pass  # D-Bus or keyring error
         
         return None
+
+    def _kwallet_get_password_dbus(browser: str) -> Optional[bytes]:
+        """Get password from KDE Wallet using D-Bus directly (no extra packages)."""
+        try:
+            import dbus
+            
+            bus = dbus.SessionBus()
+            
+            # Try kwalletd5 first, then kwalletd6 (KDE Plasma 6)
+            for service in ["org.kde.kwalletd5", "org.kde.kwalletd6"]:
+                try:
+                    kwallet = bus.get_object(service, "/modules/kwalletd5")
+                    iface = dbus.Interface(kwallet, "org.kde.KWallet")
+                    break
+                except dbus.exceptions.DBusException:
+                    try:
+                        kwallet = bus.get_object(service, "/modules/kwalletd6")
+                        iface = dbus.Interface(kwallet, "org.kde.KWallet")
+                        break
+                    except dbus.exceptions.DBusException:
+                        continue
+            else:
+                return None
+            
+            # Get wallet name
+            wallet_name = iface.localWallet()
+            if not wallet_name:
+                wallet_name = "kdewallet"
+            
+            # Open wallet
+            app_name = BROWSER_KWALLET_APP.get(browser.lower(), browser.lower())
+            handle = iface.open(wallet_name, 0, app_name)
+            if handle < 0:
+                return None
+            
+            # Get folder and key
+            folder = BROWSER_KWALLET_FOLDER.get(browser.lower(), f"{browser.title()} Keys")
+            key = f"{browser.title()} Safe Storage"
+            
+            # Try to read password
+            password = iface.readPassword(handle, folder, key, app_name)
+            if password:
+                return password.encode("utf-8") if isinstance(password, str) else password
+            
+            # Try alternative key format
+            alt_key = BROWSER_SAFE_STORAGE.get(browser.lower(), key)
+            password = iface.readPassword(handle, folder, alt_key, app_name)
+            if password:
+                return password.encode("utf-8") if isinstance(password, str) else password
+                
+        except ImportError:
+            pass  # dbus not available
+        except Exception:
+            pass
+        
+        return None
+
+    def _kwallet_get_password_cli(browser: str) -> Optional[bytes]:
+        """Get password from KDE Wallet using kwallet-query CLI tool."""
+        try:
+            folder = BROWSER_KWALLET_FOLDER.get(browser.lower(), f"{browser.title()} Keys")
+            key = BROWSER_SAFE_STORAGE.get(browser.lower(), f"{browser.title()} Safe Storage")
+            
+            # Try kwallet-query (available on most KDE systems)
+            # kwallet-query -f "Chrome Keys" -r "Chrome Safe Storage" kdewallet
+            result = subprocess.run(
+                ["kwallet-query", "-f", folder, "-r", key, "kdewallet"],
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode == 0 and result.stdout:
+                return result.stdout.strip()
+            
+            # Try alternative: kwalletcli (older tool)
+            result = subprocess.run(
+                ["kwalletcli", "-f", folder, "-e", key],
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode == 0 and result.stdout:
+                return result.stdout.strip()
+                
+        except FileNotFoundError:
+            pass  # CLI tools not installed
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
+        
+        return None
+
+    def _secret_tool_get_password(browser: str) -> Optional[bytes]:
+        """Get password using secret-tool CLI (works with both GNOME Keyring and KWallet)."""
+        try:
+            # secret-tool is part of libsecret-tools (Debian/Ubuntu) or libsecret (Fedora/Arch)
+            label = BROWSER_SAFE_STORAGE.get(browser.lower(), f"{browser.title()} Safe Storage")
+            
+            # Try by label
+            result = subprocess.run(
+                ["secret-tool", "lookup", "application", browser.lower()],
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode == 0 and result.stdout:
+                return result.stdout.strip()
+            
+            # Try with xdg schema (used by some browsers)
+            result = subprocess.run(
+                ["secret-tool", "lookup", "xdg:schema", f"chrome_libsecret_os_crypt_password_v2"],
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode == 0 and result.stdout:
+                return result.stdout.strip()
+                
+        except FileNotFoundError:
+            pass  # secret-tool not installed
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
+        
+        return None
+
+    def _linux_get_keyring_password(browser: str = "chrome") -> Optional[bytes]:
+        """
+        Get Chromium encryption password from system keyring.
+        
+        Supports:
+        - GNOME Keyring (via secretstorage/libsecret)
+        - KDE Wallet (via D-Bus or kwallet-query CLI)
+        - CLI fallback (secret-tool)
+        - Headless/no-keyring mode (returns None -> uses 'peanuts')
+        
+        Install dependencies (pick one based on your system):
+        - Debian/Ubuntu: apt install python3-secretstorage libsecret-tools
+        - Fedora/RHEL:   dnf install python3-secretstorage libsecret
+        - Arch Linux:    pacman -S python-secretstorage libsecret
+        - KDE systems:   kwallet-query is usually pre-installed
+        """
+        desktop = _detect_desktop_environment()
+        password = None
+        
+        # Try based on detected desktop environment
+        if desktop == "kde":
+            # KDE: Try KWallet first
+            password = _kwallet_get_password_dbus(browser)
+            if not password:
+                password = _kwallet_get_password_cli(browser)
+            # Fall through to GNOME Keyring if KWallet fails (some KDE setups use it)
+            if not password:
+                password = _gnome_keyring_get_password(browser)
+        else:
+            # GNOME/XFCE/Cinnamon/MATE/other: Try GNOME Keyring first
+            password = _gnome_keyring_get_password(browser)
+            if not password:
+                # Some systems might use KWallet even without KDE
+                password = _kwallet_get_password_dbus(browser)
+                if not password:
+                    password = _kwallet_get_password_cli(browser)
+        
+        # CLI fallback: secret-tool works with both backends
+        if not password:
+            password = _secret_tool_get_password(browser)
+        
+        return password
 
     def _linux_derive_key(password: bytes) -> bytes:
         """PBKDF2 key derivation: salt=saltysalt, iter=1, keylen=16"""
@@ -506,10 +776,35 @@ def get_app_bound_key_windows(user_data_dir: Path, browser_name: str = "chrome")
 
 
 if IS_LINUX:
-    def get_encryption_key_linux(user_data_dir: Path, browser_name: str = "chrome") -> bytes:
-        """Get key from keyring or use 'peanuts' fallback."""
-        password = _linux_get_keyring_password(browser_name) or LINUX_DEFAULT_PASSWORD
-        return _linux_derive_key(password)
+    def get_encryption_key_linux(user_data_dir: Path, browser_name: str = "chrome") -> Tuple[bytes, str]:
+        """
+        Get encryption key from keyring or use 'peanuts' fallback.
+        
+        Returns: (key, source) where source is one of:
+            - "gnome-keyring": Retrieved from GNOME Keyring
+            - "kwallet": Retrieved from KDE Wallet
+            - "secret-tool": Retrieved via secret-tool CLI
+            - "peanuts": Using default password (no keyring or headless)
+        """
+        password = _linux_get_keyring_password(browser_name)
+        
+        if password:
+            # Determine source based on what succeeded
+            desktop = _detect_desktop_environment()
+            if desktop == "kde":
+                source = "kwallet"
+            else:
+                source = "gnome-keyring"
+        else:
+            password = LINUX_DEFAULT_PASSWORD
+            source = "peanuts"
+        
+        return _linux_derive_key(password), source
+    
+    def get_encryption_key_linux_simple(user_data_dir: Path, browser_name: str = "chrome") -> bytes:
+        """Get key from keyring or use 'peanuts' fallback (simple version)."""
+        key, _ = get_encryption_key_linux(user_data_dir, browser_name)
+        return key
 
 
 def get_encryption_key(user_data_dir: Path, browser_name: str = "chrome") -> bytes:
@@ -517,7 +812,7 @@ def get_encryption_key(user_data_dir: Path, browser_name: str = "chrome") -> byt
     if IS_WINDOWS:
         return get_encryption_key_windows(user_data_dir)
     elif IS_LINUX:
-        return get_encryption_key_linux(user_data_dir, browser_name)
+        return get_encryption_key_linux_simple(user_data_dir, browser_name)
     else:
         raise DependencyMissing(f"Unsupported platform: {sys.platform}")
 
