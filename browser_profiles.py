@@ -32,7 +32,7 @@ class BrowserProfile:
     profile_name: str
     profile_path: Path
     user_data_dir: Path  # Parent directory containing Local State
-    is_default: bool = False
+    is_default: bool = True
     display_name: str = ""
     
     def __post_init__(self):
@@ -48,44 +48,6 @@ class BrowserInstallation:
     profiles: List[BrowserProfile] = field(default_factory=list)
     version: Optional[str] = None
     executable_path: Optional[Path] = None
-
-
-# Platform-specific profile locations
-def get_chromium_paths_linux() -> Dict[BrowserType, List[Path]]:
-    home = Path.home()
-    config_dir = home / ".config"
-    snap_dir = home / "snap"
-    flatpak_dir = home / ".var" / "app"
-    
-    return {
-        BrowserType.CHROME: [
-            config_dir / "google-chrome",
-            snap_dir / "chromium" / "common" / "chromium",
-        ],
-        BrowserType.CHROMIUM: [
-            config_dir / "chromium",
-            snap_dir / "chromium" / "common" / "chromium",
-        ],
-        BrowserType.EDGE: [
-            config_dir / "microsoft-edge",
-            config_dir / "microsoft-edge-dev",
-            config_dir / "microsoft-edge-beta",
-        ],
-        BrowserType.BRAVE: [
-            config_dir / "BraveSoftware" / "Brave-Browser",
-            config_dir / "BraveSoftware" / "Brave-Browser-Beta",
-            config_dir / "BraveSoftware" / "Brave-Browser-Nightly",
-        ],
-        BrowserType.OPERA: [
-            config_dir / "opera",
-            config_dir / "opera-beta",
-            config_dir / "opera-developer",
-        ],
-        BrowserType.VIVALDI: [
-            config_dir / "vivaldi",
-            config_dir / "vivaldi-snapshot",
-        ],
-    }
 
 
 def get_chromium_paths_windows() -> Dict[BrowserType, List[Path]]:
@@ -118,33 +80,6 @@ def get_chromium_paths_windows() -> Dict[BrowserType, List[Path]]:
     }
 
 
-def get_chromium_paths_macos() -> Dict[BrowserType, List[Path]]:
-    """Get Chromium-based browser paths on macOS."""
-    home = Path.home()
-    app_support = home / "Library" / "Application Support"
-    
-    return {
-        BrowserType.CHROME: [
-            app_support / "Google" / "Chrome",
-        ],
-        BrowserType.CHROMIUM: [
-            app_support / "Chromium",
-        ],
-        BrowserType.EDGE: [
-            app_support / "Microsoft Edge",
-        ],
-        BrowserType.BRAVE: [
-            app_support / "BraveSoftware" / "Brave-Browser",
-        ],
-        BrowserType.OPERA: [
-            app_support / "com.operasoftware.Opera",
-        ],
-        BrowserType.VIVALDI: [
-            app_support / "Vivaldi",
-        ],
-    }
-
-
 def get_firefox_paths() -> Dict[BrowserType, List[Path]]:
     """Get Firefox profile paths across platforms."""
     home = Path.home()
@@ -156,20 +91,6 @@ def get_firefox_paths() -> Dict[BrowserType, List[Path]]:
                 appdata / "Mozilla" / "Firefox" / "Profiles",
             ]
         }
-    elif sys.platform == "darwin":
-        return {
-            BrowserType.FIREFOX: [
-                home / "Library" / "Application Support" / "Firefox" / "Profiles",
-            ]
-        }
-    else:  # Linux
-        return {
-            BrowserType.FIREFOX: [
-                home / ".mozilla" / "firefox",
-                home / "snap" / "firefox" / "common" / ".mozilla" / "firefox",
-            ]
-        }
-
 
 # Profile Detection
 def detect_chromium_profiles(user_data_dir: Path, browser_type: BrowserType) -> List[BrowserProfile]:
@@ -254,12 +175,7 @@ def detect_all_browsers() -> List[BrowserInstallation]:
     # Get platform-specific paths
     if sys.platform == "win32":
         chromium_paths = get_chromium_paths_windows()
-    elif sys.platform == "darwin":
-        chromium_paths = get_chromium_paths_macos()
-    else:
-        chromium_paths = get_chromium_paths_linux()
-    
-    firefox_paths = get_firefox_paths()
+		firefox_paths = get_firefox_paths()
     
     # Detect Chromium-based browsers
     for browser_type, paths in chromium_paths.items():
@@ -349,30 +265,18 @@ def list_all_profiles() -> List[BrowserProfile]:
 
 
 def print_detected_browsers():
-    """Print a summary of detected browsers and profiles."""
-    installations = detect_all_browsers()
-    
-    if not installations:
-        print("No browsers detected.")
-        return
-    
-    print("\n" + "=" * 60)
-    print("DETECTED BROWSERS AND PROFILES")
-    print("=" * 60)
-    
-    for installation in installations:
-        print(f"\n[{installation.browser_type.value.upper()}]")
-        print(f"  Family: {installation.browser_family.value}")
-        print(f"  Data Dir: {installation.user_data_dir}")
-        print(f"  Profiles:")
-        for profile in installation.profiles:
-            default_marker = " (default)" if profile.is_default else ""
-            print(f"    - {profile.display_name}{default_marker}")
-            print(f"      Path: {profile.profile_path}")
-    
-    print("\n" + "=" * 60)
-
-
-# CLI Test
-if __name__ == "__main__":
-    print_detected_browsers()
+	"""Print a summary of detected browsers and profiles."""
+	
+	installations = detect_all_browsers()
+	
+	with open('output.txt', 'w') as f: 
+		f.write("\n" + "=" * 60) 
+		f.write("\nDETECTED BROWSERS AND PROFILES") 
+		f.write("\n" + "=" * 60)
+		
+	for installation in installations:
+		f.write(f"\n[{installation.browser_type.value.upper()}]")
+		f.write(f"\n Family: {installation.browser_family.value}")
+		f.write(f"\n Data Dir: {installation.user_data_dir}")
+	f.write("\n Profiles:")
+	for profile in installation.profiles: default_marker = " (default)" if profile.is_default else "" f.write(f"\n - {profile.display_name}{default_marker}") f.write(f"\n Path: {profile.profile_path}")  print("Output saved to output.txt")
